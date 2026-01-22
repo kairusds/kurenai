@@ -127,15 +127,21 @@ Bugs instead of tech issue? Check <#1248143380437930085>."#;
 					}
 				}
 
-				*last_author = Some(msg.author.id);
-				let idle_duration = now.duration_since(*last_activity);
-				if idle_duration.as_secs() >= 180 && id_lock.is_none() {
-					should_post = true;
+				if id_lock.is_none() {
+					let idle_duration = now.duration_since(*last_activity);
+					if idle_duration.as_secs() >= 180 {
+						should_post = true;
+					}
+				} else {
+					*last_activity = now;
 				}
+				*last_author = Some(msg.author.id);
 			}
 	
 			if let Some(id) = should_delete_id {
 				let _ = msg.channel_id.delete_message(&ctx.http, id).await;
+				let mut last_activity = self.last_activity_time.lock().unwrap();
+				*last_activity = now;
 			}
 
 			if should_post {
