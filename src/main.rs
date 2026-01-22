@@ -1,7 +1,10 @@
 use serenity::{
 	async_trait,
-	builder::GetMessages,
-	model::{gateway::Ready, channel::Message},
+	model::{
+		channel::Message,
+		gateway::Ready,
+		id::MessageId
+	},
 	prelude::*
 };
 use std::{
@@ -48,7 +51,8 @@ impl TypeMapKey for PhishingKey {
 }
 
 struct Handler {
-	last_sticky_update: Mutex<Instant>
+	last_sticky_update: Mutex<Instant>,
+	last_sticky_id: Mutex<Option<MessageId>>
 }
 
 #[async_trait]
@@ -101,32 +105,36 @@ impl EventHandler for Handler {
 
 			{
 				let mut last_update = self.last_sticky_update.lock().unwrap();
-				if Instant::now().duration_since(*last_update).as_secs() >= 3 {
+				if Instant::now().duration_since(*last_update).as_secs() >= 4 {
 					*last_update = Instant::now();
 					should_update = true;
 				}
 			}
 
 			if should_update {
-				let sticky_message = r#"## CHECK THE PINS FIRST BEFORE ASKING A QUESTION
-### 1. Having runtime errors? Install Hachimi Edge from <#1248142172004548620>.
-### 2. Did you press "Restart" on the shutdown menu after installing Hachimi?
-### 3. Do you play Riot games? If so, Vanguard is preventing you to play Umamusume with Hachimi installed.
-### 4. If none of these cover the answers to the issues you're facing, ping the Helpdesk role.
+				let sticky_message = r#"#### CHECK THE PINS FIRST BEFORE ASKING A QUESTION
+** 1. Having runtime errors? Install Hachimi Edge from **<#1248142172004548620>.
+** 2. Did you press "Restart" on the shutdown menu after installing Hachimi?**
+** 3. Do you play Riot games? If so, Vanguard is preventing you to play Umamusume with Hachimi installed.**
+** 4. If none of these cover the answers to the issues you're facing, ping the Helpdesk role.**
 
-## You will be intentionally ignored if a fix is already available for your problems on the pinned messages, the site or previous messages in this channel.
+** You will be intentionally ignored if a fix is already available for your problems on the pinned messages, the site or previous messages in this channel.**
 
 Check <#1248143380437930085> for known issues/problems."#;
 
-				if let Ok(messages) = msg.channel_id.messages(&ctx.http, GetMessages::new().limit(12)).await {
-					for old_msg in messages {
-						if old_msg.author.id == ctx.cache.current_user().id && old_msg.content.starts_with("# CHECK THE PINS FIRST ") {
-							let _ = old_msg.delete(&ctx.http).await;
-							break;
-						}
-					}
+				let old_id = {
+					let mut id_lock = self.last_sticky_id.lock().unwrap();
+					id_lock.take()
+				};
+
+				if let Some(id) = old_id {
+					let _ = msg.channel_id.delete_message(&ctx.http, id).await;
 				}
-				let _ = msg.channel_id.say(&ctx.http, sticky_message).await;
+
+				if let Ok(new_msg) = msg.channel_id.say(&ctx.http, sticky_message).await {
+					let mut id_lock = self.last_sticky_id.lock().unwrap();
+					*id_lock = Some(new_msg.id);
+				}
 			}
 		}
 
@@ -200,7 +208,8 @@ async fn main() {
 
 	let mut client = Client::builder(&token, intents)
 		.event_handler(Handler {
-			last_sticky_update: Mutex::new(Instant::now())
+			last_sticky_update: Mutex::new(Instant::now()),
+			last_sticky_id: Mutex::new(None)
 		})
 		.await
 		.expect("Err creating client");
