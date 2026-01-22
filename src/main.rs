@@ -15,7 +15,10 @@ use std::{
 	process::Command,
 	time::{Duration, Instant}
 };
-
+use rand::{
+	Rng,
+	distr::uniform::{SampleRange, SampleUniform}
+};
 use tokio::time::{interval, MissedTickBehavior};
 
 pub struct PhishingProtect {
@@ -55,6 +58,14 @@ struct Handler {
 	last_sticky_id: Mutex<Option<MessageId>>
 }
 
+fn should_reply(rate: f64) -> bool {
+	rand::rng().random_bool(rate)
+}
+
+fn rng_range<T, R>(range: R) -> T where T: SampleUniform, R: SampleRange<T> {
+	rand::rng().random_range(range)
+}
+
 #[async_trait]
 impl EventHandler for Handler {
 	async fn message(&self, ctx: Context, msg: Message) {
@@ -92,10 +103,14 @@ impl EventHandler for Handler {
 			if let Err(e) = msg.delete(&ctx.http).await {
 				eprintln!("Failed to delete phishing message: {}", e);
 			} else {
-				let response = format!("{} ban this guy", msg.author.mention());
-				if let Err(e) = msg.channel_id.say(&ctx.http, response).await {
-					eprintln!("Failed to send: {}", e);
-				}
+				let emojis = [
+					"<:unai2:1463880445669281876>",
+					"<:unai3:1463880567400566825>"
+				];
+				let index: usize = rng_range(0..emojis.len());
+				let emoji = emojis[index];
+				let response = format!("{} bad link! {}", msg.author.mention(), emoji);
+				let _ = msg.channel_id.say(&ctx.http, response).await;
 			}
 		}
 
@@ -138,10 +153,22 @@ Check <#1248143380437930085> for known issues/problems."#;
 			}
 		}
 
-		if msg.content.to_lowercase().contains("sil") {
-			let emoji = "<a:sildance:1462056515056828499>";
-			if let Err(why) = msg.reply(&ctx.http, emoji).await {
-				println!("Error sending message: {:?}", why);
+		let content_lower = msg.content.to_lowercase();
+		if content_lower.contains("sil") || content_lower.contains("still") {
+			// 2% if on help channel otherwise 20%
+			let rate = if msg.channel_id.get() == help_channel_id { 0.02 } else { 0.20 };
+
+			if should_reply(rate) {
+				let silly_emojis = [
+					"<a:sildance:1462056515056828499>",
+					"<:sillier:1463878217197682865>",
+					"<a:Sillymambo:1463878469610897485>",
+					"<:stillinstare:1463878652402860228>"
+				];
+
+				let index: usize = rng_range(0..silly_emojis.len());
+				let emoji = silly_emojis[index];
+				let _ = msg.reply(&ctx.http, emoji).await;
 			}
 		}
 	}
