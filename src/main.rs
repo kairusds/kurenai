@@ -22,27 +22,27 @@ use rand::{
 use tokio::time::{interval, MissedTickBehavior};
 
 pub struct PhishingProtect {
-	pub domains: RwLock<HashSet<String>>,
+	pub set: RwLock<HashSet<String>>,
 }
 
 impl PhishingProtect {
 	pub fn load(&self, path: &str) {
 		if let Ok(file) = File::open(path) {
 			let reader = BufReader::new(file);
-			let mut new_domains = HashSet::new();
+			let mut new_set = HashSet::new();
 
 			for line in reader.lines().filter_map(Result::ok) {
 				let trimmed = line.trim();
 				if !trimmed.is_empty() {
-					new_domains.insert(trimmed.to_lowercase());
+					new_set.insert(trimmed.to_lowercase());
 				}
 			}
 
-			new_domains.shrink_to_fit();
+			new_set.shrink_to_fit();
 
-			let mut write_lock = self.domains.write().unwrap();
-			*write_lock = new_domains;
-			println!("Phishing list updated. Total domains: {}", write_lock.len());
+			let mut write_lock = self.set.write().unwrap();
+			*write_lock = new_set;
+			println!("Phishing list updated. Total length: {}", write_lock.len());
 		}
 	}
 }
@@ -80,22 +80,10 @@ impl EventHandler for Handler {
 		drop(data);
 
 		let is_phishing = {
-			let domains = protect.domains.read().unwrap();
+			let bad_links = protect.set.read().unwrap();
 			msg.content.split_whitespace().any(|word| {
-				let word_lower = word.to_lowercase();
-
-				let domain_to_check = if word_lower.starts_with("http") {
-					let stripped = word_lower
-						.trim_start_matches("https://")
-						.trim_start_matches("http://");
-					stripped.split('/').next().unwrap_or(stripped)
-				} else {
-					&word_lower
-				};
-				let clean_domain = domain_to_check.trim_end_matches(|c: char| {
-					c == '.' || c == '/' || c == '?' || c == '!' || c == ','
-				});
-				domains.contains(clean_domain)
+				// Direct, raw match against the full link in the database
+				bad_links.contains(&word.to_lowercase())
 			})
 		};
 
@@ -211,7 +199,7 @@ async fn main() {
 	dotenvy::dotenv().ok();
 
 	let protect = Arc::new(PhishingProtect {
-		domains: RwLock::new(HashSet::new())
+		set: RwLock::new(HashSet::new())
 	});
 	protect.load("phishing.txt");
 
@@ -219,7 +207,7 @@ async fn main() {
 	tokio::spawn(async move {
 		start_daily_download(
 			// big thanks to https://github.com/Phishing-Database/Phishing.Database
-			"https://raw.githubusercontent.com/Phishing-Database/Phishing.Database/refs/heads/master/phishing-domains-ACTIVE.txt".to_string(), 
+			"https://raw.githubusercontent.com/Phishing-Database/Phishing.Database/refs/heads/master/phishing-links-ACTIVE.txt".to_string(), 
 			"phishing.txt".to_string(),
 			protect_clone
 		).await;
