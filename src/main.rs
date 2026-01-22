@@ -6,10 +6,12 @@ use serenity::{
 use std::{
 	collections::HashSet,
 	fs::{self, File},
-	io::{BufRead, BufReader, BufWriter, copy},
+	io::{BufRead, BufReader},
 	sync::{Arc, RwLock},
+	process::Command,
 	time::Duration
 };
+
 use tokio::time::{interval, MissedTickBehavior};
 
 pub struct PhishingProtect {
@@ -93,38 +95,29 @@ async fn start_hourly_download(url: String, filename: String, protect: Arc<Phish
 	let mut timer = interval(Duration::from_secs(3600));
 	timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-	let tmp_filename = format!("{}.tmp", filename);
-	let agent = ureq::agent();
-
 	loop {
 		timer.tick().await;
 		println!("Downloading {}...", url);
 
-		let result: Result<(), Box<dyn std::error::Error>> = (|| {
-			let mut response = agent
-				.get(&url)
-				.header("User-Agent", "curl/8.18.0")
-				.header("Accept", "*/*")
-				.call()?;
-			let mut reader = response.body_mut().as_reader();
+		let tmp_filename = format!("{}.tmp", filename);
+		let status = Command::new("curl")
+			.arg("-L")
+			.arg("-o")
+			.arg(&tmp_filename)
+			.arg(&url)
+			.status();
 
-			let file = File::create(&tmp_filename)?;
-			let mut writer = BufWriter::new(file);
-			
-			copy(&mut reader, &mut writer)?;
-			writer.into_inner()?;
-
-			fs::rename(&tmp_filename, &filename)?;
-			protect.load(&filename);
-
-			Ok(())
-		})();
-
-		if let Err(e) = result {
-			eprintln!("Hourly update failed: {}", e);
-			let _ = fs::remove_file(&tmp_filename);
-		} else {
-			println!("Successfully downloaded: {}", filename);
+		match status {
+			Ok(s) if s.success() => {
+				if let Err(e) = fs::rename(&tmp_filename, &filename) {
+					eprintln!("Hourly update failed: {}", e);
+				} else {
+					protect.load(&filename);
+					println!("Successfully downloaded: {}", filename);
+				}
+			}
+			Ok(s) => eprintln!("Curl exited with error: {}", s),
+			Err(e) => eprintln!("Failed to execute curl: {}", e),
 		}
 	}
 }
