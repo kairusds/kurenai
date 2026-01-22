@@ -153,7 +153,7 @@ Check <#1248143380437930085> for known issues/problems."#;
 			}
 		}
 
-		let content_lower = msg.content.to_lowercase();
+		// let content_lower = msg.content.to_lowercase();
 		// 0.2% if on help channel otherwise 3%
 		let rate = if msg.channel_id.get() == help_channel_id { 0.002 } else { 0.03 };
 		if should_reply(rate) {
