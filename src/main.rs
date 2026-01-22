@@ -112,7 +112,7 @@ impl EventHandler for Handler {
 			}
 
 			if should_update {
-				let sticky_message = r#"#### CHECK THE PINS FIRST BEFORE ASKING A QUESTION
+				let sticky_message = r#"**CHECK THE PINS FIRST BEFORE ASKING A QUESTION**
 ** 1. Having runtime errors? Install Hachimi Edge from **<#1248142172004548620>.
 ** 2. Did you press "Restart" on the shutdown menu after installing Hachimi?**
 ** 3. Do you play Riot games? If so, Vanguard is preventing you to play Umamusume with Hachimi installed.**
