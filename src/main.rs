@@ -105,7 +105,7 @@ impl EventHandler for Handler {
 
 			{
 				let mut last_update = self.last_sticky_update.lock().unwrap();
-				if Instant::now().duration_since(*last_update).as_secs() >= 4 {
+				if Instant::now().duration_since(*last_update).as_secs() >= 10 {
 					*last_update = Instant::now();
 					should_update = true;
 				}
