@@ -101,7 +101,11 @@ async fn start_hourly_download(url: String, filename: String, protect: Arc<Phish
 		println!("Downloading {}...", url);
 
 		let result: Result<(), Box<dyn std::error::Error>> = (|| {
-			let mut response = agent.get(&url).call()?;
+			let mut response = agent
+				.get(&url)
+				.header("User-Agent", "curl/8.18.0")
+				.header("Accept", "*/*")
+				.call()?;
 			let mut reader = response.body_mut().as_reader();
 
 			let file = File::create(&tmp_filename)?;
