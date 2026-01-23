@@ -1,9 +1,11 @@
 use serenity::{
 	async_trait,
+	builder::GetMessages,
 	model::{
 		channel::Message,
 		gateway::Ready,
-		id::*
+		id::*,
+		Timestamp
 	},
 	prelude::*
 };
@@ -13,7 +15,7 @@ use std::{
 	io::{BufRead, BufReader},
 	sync::{Arc, Mutex, RwLock},
 	process::Command,
-	time::{Duration, Instant}
+	time::Duration
 };
 use rand::{
 	Rng,
@@ -22,7 +24,13 @@ use rand::{
 use tokio::time::{interval, MissedTickBehavior};
 
 pub struct PhishingProtect {
-	pub set: RwLock<HashSet<String>>,
+	pub set: RwLock<HashSet<String>>
+}
+
+struct PhishingKey;
+
+impl TypeMapKey for PhishingKey {
+	type Value = Arc<PhishingProtect>;
 }
 
 impl PhishingProtect {
@@ -47,17 +55,75 @@ impl PhishingProtect {
 	}
 }
 
-struct PhishingKey;
-
-impl TypeMapKey for PhishingKey {
-	type Value = Arc<PhishingProtect>;
-}
-
-struct Handler {
+struct StickyState {
 	last_sticky_id: Mutex<Option<MessageId>>,
-	last_author_id: Mutex<Option<UserId>>,
-	last_activity_time: Mutex<Instant>
+	last_author_id: Mutex<Option<UserId>>
 }
+
+struct StickyKey;
+impl TypeMapKey for StickyKey {
+	type Value = Arc<StickyState>;
+}
+
+const HELP_CHANNEL_ID: u64 = 1248143441242619955;
+const STICKY_MESSAGE: &str = r#"# :warning: BEFORE ASKING A QUESTION :warning:
+- Having runtime errors? Install [Hachimi Edge](https://hachimi.noccu.art).
+- Check for your issue in [Troubleshooting](https://hachimi.noccu.art/docs/hachimi/troubleshooting).
+- Check the pins and backread messsages in this channel.
+
+You will be intentionally ignored if the sources mentioned above cover your issue.
+Bugs instead of tech issue? Check <#1248143380437930085>."#;
+
+async fn start_sticky_worker(ctx: Context, state: Arc<StickyState>) {
+	let mut interval = interval(Duration::from_secs(10));
+	let channel_id = ChannelId::new(HELP_CHANNEL_ID);
+
+	loop {
+		interval.tick().await;
+
+		let messages = match channel_id.messages(&ctx.http, GetMessages::new().limit(1)).await {
+			Ok(msgs) => msgs,
+			Err(e) => {
+				eprintln!("Failed to fetch last message: {}", e);
+				continue;
+			}
+		};
+
+		if let Some(last_msg) = messages.first() {
+			let now = Timestamp::now();
+			let last_msg_time = last_msg.timestamp;
+
+			let duration_since_last_msg = now.unix_timestamp() - last_msg_time.unix_timestamp();
+
+			let mut should_delete_id = None;
+			let mut should_post = false;
+
+			{
+				let mut id_lock = state.last_sticky_id.lock().unwrap();
+				if duration_since_last_msg >= 120 {
+					if id_lock.map_or(true, |id| id != last_msg.id) {
+						should_delete_id = id_lock.take();
+						should_post = true;
+					}
+				}
+			}
+
+			if let Some(id) = should_delete_id {
+				let _ = channel_id.delete_message(&ctx.http, id).await;
+			}
+
+			if should_post {
+				if let Ok(new_msg) = channel_id.say(&ctx.http, STICKY_MESSAGE).await {
+					let mut id_lock = state.last_sticky_id.lock().unwrap();
+					*id_lock = Some(new_msg.id);
+				}
+			}
+		}
+	}
+}
+		
+
+struct Handler;
 
 fn should_reply(rate: f64) -> bool {
 	rand::rng().random_bool(rate)
@@ -75,9 +141,8 @@ impl EventHandler for Handler {
 		}
 
 		let data = ctx.data.read().await;
-		let protect = data.get::<PhishingKey>()
-			.expect("PhishingProtect not found in TypeMap")
-			.clone();
+		let protect = data.get::<PhishingKey>().cloned().expect("PhishingProtect missing");
+		let sticky = data.get::<StickyKey>().cloned().expect("StickyState missing");
 		drop(data);
 
 		let is_phishing = {
@@ -100,61 +165,29 @@ impl EventHandler for Handler {
 				let response = format!("{} bad link! {}", msg.author.mention(), emoji);
 				let _ = msg.channel_id.say(&ctx.http, response).await;
 			}
-		}
+			return;
+		}		
 
-		let help_channel_id = 1248143441242619955;
-		if msg.channel_id.get() == help_channel_id {
-			let sticky_message = r#"# :warning: BEFORE ASKING A QUESTION :warning:
-- Having runtime errors? Install [Hachimi Edge](https://hachimi.noccu.art).
-- Check for your issue in [Troubleshooting](https://hachimi.noccu.art/docs/hachimi/troubleshooting).
-- Check the pins and backread messsages in this channel.
-
-You will be intentionally ignored if the sources mentioned above cover your issue.
-Bugs instead of tech issue? Check <#1248143380437930085>."#;
-			let now = Instant::now();
+		if msg.channel_id.get() == HELP_CHANNEL_ID {
 			let mut should_delete_id = None;
-			let mut should_post = false;
-
 			{
-				let mut last_author = self.last_author_id.lock().unwrap();
-				let mut last_activity = self.last_activity_time.lock().unwrap();
-				let mut id_lock = self.last_sticky_id.lock().unwrap();
+				let mut last_author = sticky.last_author_id.lock().unwrap();
+				let mut id_lock = sticky.last_sticky_id.lock().unwrap();
 
-				let is_new_author = last_author.map_or(true, |id| id != msg.author.id);
-				let idle_duration = now.duration_since(*last_activity);
-
-				if is_new_author {
-					should_delete_id = id_lock.take();
-				} else if id_lock.is_some() && idle_duration.as_secs() >= 120 {
+				if last_author.map_or(true, |id| id != msg.author.id) {
 					should_delete_id = id_lock.take();
 				}
-
-				if id_lock.is_none() && (idle_duration.as_secs() >= 120 || last_author.is_none()) {
-					should_post = true;
-				}
-
-				if is_new_author || should_post {
-					*last_activity = now;
-				}
-
 				*last_author = Some(msg.author.id);
 			}
-	
+
 			if let Some(id) = should_delete_id {
 				let _ = msg.channel_id.delete_message(&ctx.http, id).await;
-			}
-
-			if should_post {
-				if let Ok(new_msg) = msg.channel_id.say(&ctx.http, sticky_message).await {
-					let mut id_lock = self.last_sticky_id.lock().unwrap();
-					*id_lock = Some(new_msg.id);
-				}
 			}
 		}
 
 		// let content_lower = msg.content.to_lowercase();
 		// 0.2% if on help channel otherwise 3%
-		let rate = if msg.channel_id.get() == help_channel_id { 0.002 } else { 0.03 };
+		let rate = if msg.channel_id.get() == HELP_CHANNEL_ID { 0.002 } else { 0.03 };
 		if should_reply(rate) {
 			let silly_emojis = [
 				"<a:sildance:1462056515056828499>",
@@ -169,8 +202,15 @@ Bugs instead of tech issue? Check <#1248143380437930085>."#;
 		}
 	}
 
-	async fn ready(&self, _: Context, ready: Ready) {
+	async fn ready(&self, ctx: Context, ready: Ready) {
 		println!("{} is connected!", ready.user.name);
+		let data = ctx.data.read().await;
+		let sticky_state = data.get::<StickyKey>().cloned().expect("StickyKey missing");
+
+		let ctx_clone = ctx.clone();
+		tokio::spawn(async move {
+			start_sticky_worker(ctx_clone, sticky_state).await;
+		});
 	}
 }
 
@@ -214,6 +254,11 @@ async fn main() {
 	});
 	protect.load("phishing.txt");
 
+	let sticky_state = Arc::new(StickyState {
+		last_sticky_id: Mutex::new(None),
+		last_author_id: Mutex::new(None)
+	});
+
 	let protect_clone = Arc::clone(&protect);
 	tokio::spawn(async move {
 		start_daily_download(
@@ -229,17 +274,14 @@ async fn main() {
 		| GatewayIntents::MESSAGE_CONTENT;
 
 	let mut client = Client::builder(&token, intents)
-		.event_handler(Handler {
-			last_sticky_id: Mutex::new(None),
-			last_author_id: Mutex::new(None),
-			last_activity_time: Mutex::new(Instant::now())
-		})
+		.event_handler(Handler)
 		.await
 		.expect("Err creating client");
 
 	{
 		let mut data = client.data.write().await;
 		data.insert::<PhishingKey>(protect);
+		data.insert::<StickyKey>(sticky_state);
 	}
 
 	if let Err(why) = client.start().await {
