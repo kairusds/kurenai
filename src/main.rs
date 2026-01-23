@@ -174,9 +174,12 @@ impl EventHandler for Handler {
 				let mut last_author = sticky.last_author_id.lock().unwrap();
 				let mut id_lock = sticky.last_sticky_id.lock().unwrap();
 
-				if last_author.map_or(true, |id| id != msg.author.id) {
-					should_delete_id = id_lock.take();
+				if let Some(previous_author_id) = *last_author {
+					if previous_author_id != msg.author.id {
+						should_delete_id = id_lock.take();
+					}
 				}
+
 				*last_author = Some(msg.author.id);
 			}
 
