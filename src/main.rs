@@ -268,7 +268,7 @@ async fn main() {
 	tokio::spawn(async move {
 		start_daily_download(
 			// big thanks to https://github.com/Phishing-Database/Phishing.Database
-			"https://raw.githubusercontent.com/Phishing-Database/Phishing.Database/refs/heads/master/phishing-links-ACTIVE.txt".to_string(), 
+			"https://phish.co.za/latest/phishing-links-ACTIVE.txt".to_string(), 
 			"phishing.txt".to_string(),
 			protect_clone
 		).await;
