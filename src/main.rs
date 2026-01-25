@@ -166,26 +166,6 @@ impl EventHandler for Handler {
 				let _ = msg.channel_id.say(&ctx.http, response).await;
 			}
 			return;
-		}		
-
-		if msg.channel_id.get() == HELP_CHANNEL_ID {
-			let mut should_delete_id = None;
-			{
-				let mut last_author = sticky.last_author_id.lock().unwrap();
-				let mut id_lock = sticky.last_sticky_id.lock().unwrap();
-
-				if let Some(previous_author_id) = *last_author {
-					if previous_author_id != msg.author.id {
-						should_delete_id = id_lock.take();
-					}
-				}
-
-				*last_author = Some(msg.author.id);
-			}
-
-			if let Some(id) = should_delete_id {
-				let _ = msg.channel_id.delete_message(&ctx.http, id).await;
-			}
 		}
 
 		// let content_lower = msg.content.to_lowercase();
@@ -204,6 +184,26 @@ impl EventHandler for Handler {
 			let _ = msg.reply(&ctx.http, emoji).await;
 			if let Ok(reaction) = ReactionType::try_from(emoji) {
 				let _ = msg.react(&ctx.http, reaction).await;
+			}
+		}
+
+		if msg.channel_id.get() == HELP_CHANNEL_ID {
+			let mut should_delete_id = None;
+			{
+				let mut last_author = sticky.last_author_id.lock().unwrap();
+				let mut id_lock = sticky.last_sticky_id.lock().unwrap();
+
+				if let Some(previous_author_id) = *last_author {
+					if previous_author_id != msg.author.id {
+						should_delete_id = id_lock.take();
+					}
+				}
+
+				*last_author = Some(msg.author.id);
+			}
+
+			if let Some(id) = should_delete_id {
+				let _ = msg.channel_id.delete_message(&ctx.http, id).await;
 			}
 		}
 	}
