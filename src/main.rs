@@ -72,6 +72,7 @@ const STICKY_MESSAGE: &str = r#"# :warning: BEFORE ASKING A QUESTION :warning:
 - Check the pins and backread messsages in this channel.
 
 You will be intentionally ignored if the sources mentioned above cover your issue.
+Still can't find the solution for your problem? Ping the `@Helpdesk` role.
 Bugs instead of tech issue? Check <#1248143380437930085>."#;
 
 async fn start_sticky_worker(ctx: Context, state: Arc<StickyState>) {
