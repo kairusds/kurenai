@@ -68,7 +68,7 @@ impl TypeMapKey for StickyKey {
 const HELP_CHANNEL_ID: u64 = 1248143441242619955;
 const STICKY_MESSAGE: &str = r#"# :warning: BEFORE ASKING A QUESTION :warning:
 - Having runtime errors? Install [Hachimi Edge](https://hachimi.noccu.art).
-- Check for your issue in [Troubleshooting](https://hachimi.noccu.art/docs/hachimi/troubleshooting).
+- Check for your issue in [Troubleshooting](https://hachimi.noccu.art/docs/hachimi/troubleshooting) or the [FAQ](https://hachimi.noccu.art/docs/hachimi/faqs).
 - Check the pins and backread messsages in this channel.
 
 You will be intentionally ignored if the sources mentioned above cover your issue.
