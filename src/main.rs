@@ -56,6 +56,7 @@ impl PhishingProtect {
 }
 
 struct StickyState {
+	enabled: bool,
 	last_sticky_id: Mutex<Option<MessageId>>,
 	last_author_id: Mutex<Option<UserId>>
 }
@@ -213,10 +214,12 @@ impl EventHandler for Handler {
 		let data = ctx.data.read().await;
 		let sticky_state = data.get::<StickyKey>().cloned().expect("StickyKey missing");
 
-		let ctx_clone = ctx.clone();
-		tokio::spawn(async move {
-			start_sticky_worker(ctx_clone, sticky_state).await;
-		});
+		if sticky_state.enabled {
+			let ctx_clone = ctx.clone();
+			tokio::spawn(async move {
+				start_sticky_worker(ctx_clone, sticky_state).await;
+			});
+		}
 	}
 }
 
@@ -261,6 +264,7 @@ async fn main() {
 	protect.load("phishing.txt");
 
 	let sticky_state = Arc::new(StickyState {
+		enabled: false,
 		last_sticky_id: Mutex::new(None),
 		last_author_id: Mutex::new(None)
 	});
