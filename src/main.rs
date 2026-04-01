@@ -44,10 +44,12 @@ struct GachaTier {
 }
 
 const SSR_ROLE_DROPS: &[RoleGachaDrop] = &[
-	RoleGachaDrop { role_id: 1488672805024436344, label: "S9" },
-	RoleGachaDrop { role_id: 1488672138121580675, label: "S" },
-	RoleGachaDrop { role_id: 1488672215024009298, label: "A9" },
-	RoleGachaDrop { role_id: 1488673139427770398, label: "A" },
+	RoleGachaDrop { role_id: 1488672805024436344, label: "SS+" },
+	RoleGachaDrop { role_id: 1488672138121580675, label: "SS" },
+	RoleGachaDrop { role_id: 1488672215024009298, label: "S+" },
+	RoleGachaDrop { role_id: 1488673139427770398, label: "S" },
+	RoleGachaDrop { role_id: 1488695883892523179, label: "A+" },
+	RoleGachaDrop { role_id: 1488695909301620827, label: "A" },
 ];
 
 const UR_ROLE_DROPS: &[RoleGachaDrop] = &[
