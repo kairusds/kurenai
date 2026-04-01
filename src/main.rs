@@ -5,7 +5,8 @@ use serenity::{
 		channel::*,
 		gateway::Ready,
 		id::*,
-		Timestamp
+		Timestamp,
+		user::PremiumType
 	},
 	prelude::*
 };
@@ -39,11 +40,32 @@ pub struct RoleGachaDrop {
 }
 
 #[derive(Clone)]
-struct GachaTier {
-	tier_name: &'static str,
-	base_weight: u32,
-	jitter: u32,
-	drops: &'static [RoleGachaDrop]
+pub struct SpecialGachaDrop {
+	pub prize: &'static str,
+	pub message: &'static str,
+}
+
+const UR_SPECIAL_DROPS: &[SpecialGachaDrop] = &[
+	SpecialGachaDrop { prize: "classic_nitro", message: "...Someday, will you expose... more of yourself to me?
+
+Congratulations! You won a free Classic Nitro for 1 month! Ping <@757971702658498570> with a screenshot of me replying to you with this message to claim it!
+You also need to copy this message's link as proof!
+Make sure your DM's are open so you can be privately messaged for the prize." },
+];
+
+const SPECIAL_GACHA_POOL: [GachaTier<SpecialGachaDrop>; 5] =[
+	GachaTier { tier_name: "UR", base_weight: 5, jitter: 2, drops: UR_SPECIAL_DROPS },
+	GachaTier { tier_name: "SSR", base_weight: 750, jitter: 150, drops: &[] },
+	GachaTier { tier_name: "R", base_weight: 556, jitter: 80, drops: &[] },
+	GachaTier { tier_name: "SR", base_weight: 191, jitter: 40, drops: &[] },
+	GachaTier { tier_name: "草", base_weight: 98498, jitter: 5000, drops: &[] },
+];
+
+pub struct GachaTier<T: 'static> {
+	pub tier_name: &'static str,
+	pub base_weight: u32,
+	pub jitter: u32,
+	pub drops: &'static [T]
 }
 
 const SSR_ROLE_DROPS: &[RoleGachaDrop] = &[
@@ -73,7 +95,7 @@ const R_ROLE_DROPS: &[RoleGachaDrop] = &[
 	RoleGachaDrop { role_id: 1488673384777912402, label: "G" },
 ];
 
-const ROLE_GACHA_POOL: [GachaTier; 5] = [
+const ROLE_GACHA_POOL: [GachaTier<RoleGachaDrop>; 5] =[
 	GachaTier { tier_name: "UR", base_weight: 5, jitter: 2, drops: UR_ROLE_DROPS },
 	GachaTier { tier_name: "SSR", base_weight: 750, jitter: 150, drops: SSR_ROLE_DROPS },
 	GachaTier { tier_name: "R", base_weight: 556, jitter: 80, drops: R_ROLE_DROPS },
@@ -94,7 +116,12 @@ impl EntropyState {
 	}
 }
 
-pub fn perform_gacha_pull(user_id: u64, message_id: u64, content: &str) -> Option<(&'static str, RoleGachaDrop)> {
+pub fn perform_gacha_pull<T: Clone + 'static>(
+	user_id: u64, 
+	message_id: u64, 
+	content: &str, 
+	pool: &[GachaTier<T>]
+) -> Option<(&'static str, T)> {
 	let mut state = EntropyState::new();
 
 	let sys_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
@@ -119,14 +146,14 @@ pub fn perform_gacha_pull(user_id: u64, message_id: u64, content: &str) -> Optio
 
 	let mut rng = ChaCha20Rng::from_seed(state.chacha_seed);
 
-	let mut dynamic_pool: Vec<(GachaTier, u32)> = Vec::with_capacity(ROLE_GACHA_POOL.len());
+	let mut dynamic_pool: Vec<(&GachaTier<T>, u32)> = Vec::with_capacity(pool.len());
 	let mut total_weight: u32 = 0;
 
-	for tier in ROLE_GACHA_POOL.iter() {
+	for tier in pool.iter() {
 		let variance = rng.random_range(0..=(tier.jitter * 2));
 		let mutated_weight = (tier.base_weight + variance).saturating_sub(tier.jitter);
 		
-		dynamic_pool.push((tier.clone(), mutated_weight));
+		dynamic_pool.push((tier, mutated_weight));
 		total_weight += mutated_weight;
 	}
 
@@ -429,7 +456,7 @@ impl EventHandler for Handler {
 		}
 
 		if is_special_day() && !GACHA_IGNORE_USER_LIST.contains(&msg.author.id.get()) {
-			if let Some((tier_name, outcome)) = perform_gacha_pull(msg.author.id.get(), msg.id.get(), &msg.content) {
+			if let Some((tier_name, outcome)) = perform_gacha_pull(msg.author.id.get(), msg.id.get(), &msg.content, &ROLE_GACHA_POOL) {
 				let role_id_raw = outcome.role_id;
 				let role_id = RoleId::new(role_id_raw);
 				let guild_id = msg.guild_id.unwrap();
@@ -462,6 +489,36 @@ impl EventHandler for Handler {
 						} else if tier_name == "R" {
 							let _ = msg.reply(&ctx.http, format!("...You received [R] {}. Please do not be discouraged... Even if fortune did not favor you this time... I am right here. I will accept everything about you, so... please, let me comfort you...", outcome.label)).await;
 						}
+					}
+				}
+			}
+		}
+
+		if let Some((_tier, outcome)) = perform_gacha_pull(msg.author.id.get(), msg.id.get(), &msg.content, &SPECIAL_GACHA_POOL) {
+			let prize = outcome.prize;
+
+			if prize == "classic_nitro" && msg.author.premium_type == PremiumType::None {
+				let winner_file = "nitro_claimed.txt";
+
+				if std::path::Path::new(winner_file).exists() {
+					return;
+				}
+
+				if let Ok(bot_reply) = msg.reply(&ctx.http, outcome.message).await {
+					let winner_msg_link = msg.link();
+					let bot_reply_link = bot_reply.link();
+
+					let log_entry = format!(
+						"Winner: {} ({})\nTime: {}\nWinner Message: {}\nBot Reply: {}\n-------------------\n",
+						msg.author.name, 
+						msg.author.id,
+						Timestamp::now(),
+						winner_msg_link,
+						bot_reply_link
+					);
+
+					if let Err(e) = fs::write(winner_file, log_entry) {
+						eprintln!("Failed to save nitro winner log: {}", e);
 					}
 				}
 			}
