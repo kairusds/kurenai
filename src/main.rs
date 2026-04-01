@@ -25,7 +25,10 @@ use rand::{
 use sha3::{Sha3_512, Digest};
 use zeroize_derive::{Zeroize, ZeroizeOnDrop};
 use tokio::time::{interval, MissedTickBehavior};
-use chrono::{Datelike, Local};
+use chrono::{Datelike, /* Utc */Local};
+// use chrono_tz::Asia::Tokyo;
+
+const GACHA_IGNORE_USER_LIST: [u64; 1] = [757971702658498570];
 
 static PULL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -70,7 +73,7 @@ const R_ROLE_DROPS: &[RoleGachaDrop] = &[
 	RoleGachaDrop { role_id: 1488673384777912402, label: "G" },
 ];
 
-const ROLE_GACHA_POOL: [GachaTier; 5] =[
+const ROLE_GACHA_POOL: [GachaTier; 5] = [
 	GachaTier { tier_name: "UR", base_weight: 5, jitter: 2, drops: UR_ROLE_DROPS },
 	GachaTier { tier_name: "SSR", base_weight: 750, jitter: 150, drops: SSR_ROLE_DROPS },
 	GachaTier { tier_name: "R", base_weight: 556, jitter: 80, drops: R_ROLE_DROPS },
@@ -151,7 +154,7 @@ pub fn perform_gacha_pull(user_id: u64, message_id: u64, content: &str) -> Optio
 }
 
 fn is_special_day() -> bool {
-	let now = Local::now();
+	let now = Local::now(); // Utc::now().with_timezone(&Tokyo);
 
 	// mm/dd
 	let special_days = [
@@ -181,6 +184,50 @@ fn is_special_day() -> bool {
 
 	special_days.contains(&(now.month(), now.day()))
 }
+
+pub struct StoryLines {
+	pub lines: RwLock<Vec<String>>
+}
+
+struct StoryLinesKey;
+
+impl TypeMapKey for StoryLinesKey {
+	type Value = Arc<StoryLines>;
+}
+
+impl StoryLines {
+	pub fn load(&self, path: &str) {
+		if let Ok(file) = File::open(path) {
+			let reader = BufReader::new(file);
+			let mut new_lines = Vec::new();
+
+			for line in reader.lines().filter_map(Result::ok) {
+				let trimmed = line.trim();
+				if !trimmed.is_empty() {
+					new_lines.push(trimmed.to_string());
+				}
+			}
+
+			new_lines.shrink_to_fit();
+
+			let mut write_lock = self.lines.write().unwrap();
+			*write_lock = new_lines;
+			println!("Story lines loaded. Total length: {}", write_lock.len());
+		} else {
+			eprintln!("Failed to open {} - make sure it exists!", path);
+		}
+	}
+
+	pub fn get_random(&self) -> Option<String> {
+		let lock = self.lines.read().unwrap();
+		if lock.is_empty() {
+			return None;
+		}
+		let index: usize = rng_range(0..lock.len());
+		Some(lock[index].clone())
+	}
+}
+
 
 pub struct PhishingProtect {
 	pub set: RwLock<HashSet<String>>
@@ -367,7 +414,19 @@ impl EventHandler for Handler {
 			}
 		}
 
-		if is_special_day() {
+		// 0.01% on help channel, 0.5% on all channels
+		let msg_rate = if msg.channel_id.get() == HELP_CHANNEL_ID { 0.0001 } else { 0.005 };
+		if should_show(msg_rate) {
+			let data = ctx.data.read().await;
+			let stories = data.get::<StoryLinesKey>().cloned().expect("StoryLines missing");
+			drop(data);
+
+			if let Some(random_quote) = stories.get_random() {
+				let _ = msg.reply(&ctx.http, random_quote).await;
+			}
+		}
+
+		if is_special_day() && !GACHA_IGNORE_USER_LIST.contains(&msg.author.id.get()) {
 			if let Some((tier_name, outcome)) = perform_gacha_pull(msg.author.id.get(), msg.id.get(), &msg.content) {
 				let role_id_raw = outcome.role_id;
 				let role_id = RoleId::new(role_id_raw);
@@ -378,7 +437,29 @@ impl EventHandler for Handler {
 	
 				if !has_role {
 					if let Ok(_) = ctx.http.add_member_role(guild_id, msg.author.id, role_id, Some("Role gacha from Silly bot")).await {
-						let _ = msg.reply(&ctx.http, format!("You have acquired [{}] {}", tier_name, outcome.label)).await;
+						if tier_name == "UR" {
+							let ur_messages = [
+								"...Ah. My love... you obtained [UR] {}. As expected of mY destined pErson... Ahh, seeing you so blessed makes my heart buzz... I want to take all of this joy, and... slurp it up... Fufu...",
+								"...Ah! T-Trainer-san... You got [UR] {}! I am... so incredibly glad that such wonderful fortune has found you. To think I am allowed to share this special moment right by your side... Is it really okay... for me to receive this much happiness...?"
+							];
+							
+							let index: usize = rng_range(0..ur_messages.len());
+							let response = ur_messages[index].replace("{}", outcome.label);
+							let _ = msg.reply(&ctx.http, response).await;
+						} else if tier_name == "SSR" {
+							let ssr_messages = [
+								"...Congratulations, Trainer-san. You managed to welcome [SSR] {}. Seeing your joyful expression makes me... so very happy, too. ...Please, let me stay by your side and watch you... mooore...",
+								"...Ah... fufu. I'm so happy you got [SSR] {}, my Trainer-san. Seeing how delighted you are... it makes me feel like I am submerged in warm water. ...I hope I can always be here... to share these gentle feelings with you..."
+							];
+							
+							let index: usize = rng_range(0..ssr_messages.len());
+							let response = ssr_messages[index].replace("{}", outcome.label);
+							let _ = msg.reply(&ctx.http, response).await;
+						} else if tier_name == "SR" {
+							let _ = msg.reply(&ctx.http, format!("...My, you got [SR] {}. That is wonderful, isn't it. ...Fufu, whether the result is grand or modest, as long as I can share this time with you... I feel like I can be alright.", outcome.label)).await;
+						} else if tier_name == "R" {
+							let _ = msg.reply(&ctx.http, format!("...You received [R] {}. Please do not be discouraged... Even if fortune did not favor you this time... I am right here. I will accept everything about you, so... please, let me comfort you...", outcome.label)).await;
+						}
 					}
 				}
 			}
@@ -439,6 +520,11 @@ async fn main() {
 	});
 	protect.load("phishing.txt");
 
+	let story_lines = Arc::new(StoryLines {
+		lines: RwLock::new(Vec::new())
+	});
+	story_lines.load("chara_story_lines.txt");
+
 	let sticky_state = Arc::new(StickyState {
 		enabled: false,
 		last_sticky_id: Mutex::new(None),
@@ -469,6 +555,7 @@ async fn main() {
 		let mut data = client.data.write().await;
 		data.insert::<PhishingKey>(protect);
 		data.insert::<StickyKey>(sticky_state);
+		data.insert::<StoryLinesKey>(story_lines);
 	}
 
 	if let Err(why) = client.start().await {
