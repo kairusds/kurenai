@@ -343,7 +343,9 @@ fn rng_range<T, R>(range: R) -> T where T: SampleUniform, R: SampleRange<T> {
 #[async_trait]
 impl EventHandler for Handler {
 	async fn message(&self, ctx: Context, msg: Message) {
-		if msg.author.bot {
+		let target_guild_id = 1248085334861025350; // hachimi project official server
+
+		if msg.author.bot || msg.guild_id.map_or(true, |id| id.get() != target_guild_id) {
 			return;
 		}
 
