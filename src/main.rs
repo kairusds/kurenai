@@ -432,7 +432,7 @@ impl EventHandler for Handler {
 			if let Some((tier_name, outcome)) = perform_gacha_pull(msg.author.id.get(), msg.id.get(), &msg.content) {
 				let role_id_raw = outcome.role_id;
 				let role_id = RoleId::new(role_id_raw);
-				let guild_id = msg.guild_id.expect("Only works in servers");
+				let guild_id = msg.guild_id.unwrap();
 	
 				let has_role = msg.member.as_ref()
 					.map_or(false, |m| m.roles.contains(&role_id));
