@@ -13,15 +13,172 @@ use std::{
 	collections::HashSet,
 	fs::{self, File},
 	io::{BufRead, BufReader},
-	sync::{Arc, Mutex, RwLock},
+	sync::{Arc, Mutex, RwLock, atomic::{AtomicU64, Ordering}},
 	process::Command,
-	time::Duration
+	time::{Duration, SystemTime, UNIX_EPOCH}
 };
 use rand::{
-	Rng,
-	distr::uniform::{SampleRange, SampleUniform}
+	RngExt, SeedableRng, TryRng,
+	distr::uniform::{SampleRange, SampleUniform},
+	rngs::{ChaCha20Rng, SysRng}
 };
+use sha3::{Sha3_512, Digest};
+use zeroize_derive::{Zeroize, ZeroizeOnDrop};
 use tokio::time::{interval, MissedTickBehavior};
+use chrono::{Datelike, Local};
+
+static PULL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone)]
+pub struct RoleGachaDrop {
+	pub role_id: u64,
+	pub label: &'static str,
+}
+
+#[derive(Clone)]
+struct GachaTier {
+	tier_name: &'static str,
+	base_weight: u32,
+	jitter: u32,
+	drops: &'static [RoleGachaDrop]
+}
+
+const SSR_ROLE_DROPS: &[RoleGachaDrop] = &[
+	RoleGachaDrop { role_id: 1488672805024436344, label: "S9" },
+	RoleGachaDrop { role_id: 1488672138121580675, label: "S" },
+	RoleGachaDrop { role_id: 1488672215024009298, label: "A9" },
+	RoleGachaDrop { role_id: 1488673139427770398, label: "A" },
+];
+
+const UR_ROLE_DROPS: &[RoleGachaDrop] = &[
+	RoleGachaDrop { role_id: 1488672177937977435, label: "UF" },
+	RoleGachaDrop { role_id: 1488672678440075354, label: "UG9" },
+	RoleGachaDrop { role_id: 1488672713005596682, label: "UG" },
+];
+
+const SR_ROLE_DROPS: &[RoleGachaDrop] = &[
+	RoleGachaDrop { role_id: 1488672903468941502, label: "B" },
+	RoleGachaDrop { role_id: 1488672484411703396, label: "C" },
+];
+
+const R_ROLE_DROPS: &[RoleGachaDrop] = &[
+	RoleGachaDrop { role_id: 1488672445358411848, label: "D" },
+	RoleGachaDrop { role_id: 1488673341798613022, label: "E" },
+	RoleGachaDrop { role_id: 1488672878130892920, label: "F" },
+	RoleGachaDrop { role_id: 1488673384777912402, label: "G" },
+];
+
+const ROLE_GACHA_POOL: [GachaTier; 5] =[
+	GachaTier { tier_name: "UR", base_weight: 5, jitter: 2, drops: UR_ROLE_DROPS },
+	GachaTier { tier_name: "SSR", base_weight: 750, jitter: 150, drops: SSR_ROLE_DROPS },
+	GachaTier { tier_name: "R", base_weight: 556, jitter: 80, drops: R_ROLE_DROPS },
+	GachaTier { tier_name: "SR", base_weight: 191, jitter: 40, drops: SR_ROLE_DROPS },
+	GachaTier { tier_name: "草", base_weight: 98498, jitter: 5000, drops: &[] },
+];
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct EntropyState {
+	os_seed:[u8; 64],
+	pq_hash_bytes: [u8; 64],
+	chacha_seed: [u8; 32],
+}
+
+impl EntropyState {
+	fn new() -> Self {
+		Self { os_seed: [0u8; 64], pq_hash_bytes: [0u8; 64], chacha_seed: [0u8; 32] }
+	}
+}
+
+pub fn perform_gacha_pull(user_id: u64, message_id: u64, content: &str) -> Option<(&'static str, RoleGachaDrop)> {
+	let mut state = EntropyState::new();
+
+	let sys_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+	let counter = PULL_COUNTER.fetch_add(1, Ordering::SeqCst);
+
+	if SysRng.try_fill_bytes(&mut state.os_seed).is_err() {
+		return None;
+	}
+
+	let mut hasher = Sha3_512::new();
+	hasher.update(&state.os_seed);
+	hasher.update(user_id.to_le_bytes());
+	hasher.update(message_id.to_le_bytes());
+	hasher.update((sys_time.subsec_nanos() as u64).to_le_bytes());
+	hasher.update(sys_time.as_secs().to_le_bytes());
+	hasher.update(counter.to_le_bytes());
+	hasher.update(content.as_bytes());
+
+	let pq_hash = hasher.finalize();
+	state.pq_hash_bytes.copy_from_slice(&pq_hash);
+	state.chacha_seed.copy_from_slice(&state.pq_hash_bytes[0..32]);
+
+	let mut rng = ChaCha20Rng::from_seed(state.chacha_seed);
+
+	let mut dynamic_pool: Vec<(GachaTier, u32)> = Vec::with_capacity(ROLE_GACHA_POOL.len());
+	let mut total_weight: u32 = 0;
+
+	for tier in ROLE_GACHA_POOL.iter() {
+		let variance = rng.random_range(0..=(tier.jitter * 2));
+		let mutated_weight = (tier.base_weight + variance).saturating_sub(tier.jitter);
+		
+		dynamic_pool.push((tier.clone(), mutated_weight));
+		total_weight += mutated_weight;
+	}
+
+	let mut roll = rng.random_range(0..total_weight);
+	let mut selected_tier = None;
+
+	for (tier, weight) in dynamic_pool {
+		if roll < weight {
+			selected_tier = Some(tier);
+			break;
+		}
+		roll -= weight;
+	}
+
+	if let Some(tier) = selected_tier {
+		if tier.drops.is_empty() {
+			return None;
+		}
+
+		let drop_index = rng.random_range(0..tier.drops.len());
+		return Some((tier.tier_name, tier.drops[drop_index].clone()));
+	}
+
+	None
+}
+
+fn is_special_day() -> bool {
+	let now = Local::now();
+
+	// mm/dd
+	let special_days = [
+		(1, 1), // new year
+		(2, 14), // valentine's
+		(3, 14), // white day (jp holiday)
+		(4, 1), // april fools
+		// golden week //
+		(4, 29),
+		(4, 30),
+		(5, 1),
+		(5, 2),
+		(5, 3),
+		(5, 4),
+		(5, 5),
+		(5, 6),
+		//////////////////
+		// obon //
+		(8, 13),
+		(8, 14),
+		(8, 15),
+		(8, 16),
+		//////////
+		(10, 31), // halloween
+		(12, 25), // christmas
+	];
+
+	special_days.contains(&(now.month(), now.day()))
+}
 
 pub struct PhishingProtect {
 	pub set: RwLock<HashSet<String>>
@@ -207,6 +364,23 @@ impl EventHandler for Handler {
 				let _ = msg.react(&ctx.http, reaction).await;
 			}
 		}
+
+		if is_special_day() {
+			if let Some((tier_name, outcome)) = perform_gacha_pull(msg.author.id.get(), msg.id.get(), &msg.content) {
+				let role_id_raw = outcome.role_id;
+				let role_id = RoleId::new(role_id_raw);
+				let guild_id = msg.guild_id.expect("Only works in servers");
+	
+				let has_role = msg.member.as_ref()
+					.map_or(false, |m| m.roles.contains(&role_id));
+	
+				if !has_role {
+					if let Ok(_) = ctx.http.add_member_role(guild_id, msg.author.id, role_id, Some("Role gacha from Silly bot")).await {
+						let _ = msg.reply(&ctx.http, format!("You have acquired [{}] {}", tier_name, outcome.label)).await;
+					}
+				}
+			}
+		}
 	}
 
 	async fn ready(&self, ctx: Context, ready: Ready) {
@@ -281,7 +455,8 @@ async fn main() {
 
 	let token = std::env::var("TOKEN").expect("Expected a token in the environment");
 	let intents = GatewayIntents::GUILD_MESSAGES
-		| GatewayIntents::MESSAGE_CONTENT;
+		| GatewayIntents::MESSAGE_CONTENT
+		| GatewayIntents::GUILD_MEMBERS;
 
 	let mut client = Client::builder(&token, intents)
 		.event_handler(Handler)
