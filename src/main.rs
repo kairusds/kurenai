@@ -46,11 +46,10 @@ pub struct SpecialGachaDrop {
 }
 
 const UR_SPECIAL_DROPS: &[SpecialGachaDrop] = &[
-	SpecialGachaDrop { prize: "classic_nitro", message: "...Someday, will you expose... more of yourself to me?
-
-Congratulations! You won a free Classic Nitro for 1 month! Ping <@757971702658498570> with a screenshot of me replying to you with this message to claim it!
-You also need to copy this message's link as proof!
-Make sure your DM's are open so you can be privately messaged for the prize." },
+	SpecialGachaDrop { prize: "basic_nitro", message: "Yes... but I am not afraid. As long as I am with you, no matter what path it may be...
+...--Therefore, please do not fear, either.
+...Someday, will you expose... more of yourself to me?
+<@757971702658498570>" },
 ];
 
 const SPECIAL_GACHA_POOL: [GachaTier<SpecialGachaDrop>; 5] =[
@@ -497,7 +496,7 @@ impl EventHandler for Handler {
 		if let Some((_tier, outcome)) = perform_gacha_pull(msg.author.id.get(), msg.id.get(), &msg.content, &SPECIAL_GACHA_POOL) {
 			let prize = outcome.prize;
 
-			if prize == "classic_nitro" && msg.author.premium_type == PremiumType::None {
+			if prize == "basic_nitro" && msg.author.premium_type == PremiumType::None {
 				let winner_file = "nitro_claimed.txt";
 
 				if std::path::Path::new(winner_file).exists() {
