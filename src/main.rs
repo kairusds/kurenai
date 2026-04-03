@@ -186,7 +186,9 @@ fn is_special_day() -> bool {
 	let special_days = [
 		(1, 1), // new year
 		(2, 14), // valentine's
+		(2, 24), // uma jp anniversary
 		(3, 14), // white day (jp holiday)
+		(3, 29), // hachimi's first release (https://github.com/Hachimi-Hachimi/Hachimi/releases/tag/v0.1.0)
 		(4, 1), // april fools
 		// golden week //
 		(4, 29),
@@ -198,13 +200,29 @@ fn is_special_day() -> bool {
 		(5, 5),
 		(5, 6),
 		//////////////////
+		// june bride //
+		(6, 7),
+		(6, 8),
+		(6, 9),
+		(6, 10),
+		(6, 11),
+		(6, 12),
+		(6, 13),
+		///////////////
+		(7, 7), // tanabata
+		(7, 20), // marine day
 		// obon //
 		(8, 13),
 		(8, 14),
 		(8, 15),
 		(8, 16),
 		//////////
+		(8, 24), // uma jp half anniversary
+		(8, 25), // otsukimi
+		(10, 12), // sports day
 		(10, 31), // halloween
+		(11, 23), // labor thanksgiving day
+		(12, 24), // christmas eve
 		(12, 25), // christmas
 	];
 
