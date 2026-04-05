@@ -27,7 +27,8 @@ use sha3::{Sha3_512, Digest};
 use zeroize_derive::{Zeroize, ZeroizeOnDrop};
 use tokio::time::{interval, MissedTickBehavior};
 use chrono::{Datelike, Utc};
-use chrono_tz::Asia::Tokyo;
+// use chrono_tz::Asia::Tokyo;
+use chrono_tz::America::Los_Angeles;
 
 const GACHA_IGNORE_USER_LIST: [u64; 1] = [757971702658498570];
 
@@ -180,7 +181,7 @@ pub fn perform_gacha_pull<T: Clone + 'static>(
 }
 
 fn is_special_day() -> bool {
-	let now = Utc::now().with_timezone(&Tokyo);
+	let now = Utc::now().with_timezone(&Los_Angeles/*&Tokyo*/);
 
 	// mm/dd
 	let special_days = [
@@ -190,6 +191,7 @@ fn is_special_day() -> bool {
 		(3, 14), // white day (jp holiday)
 		(3, 29), // hachimi's first release (https://github.com/Hachimi-Hachimi/Hachimi/releases/tag/v0.1.0)
 		(4, 1), // april fools
+		(4, 5), // easter
 		// golden week //
 		(4, 29),
 		(4, 30),
