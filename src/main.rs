@@ -27,8 +27,7 @@ use sha3::{Sha3_512, Digest};
 use zeroize_derive::{Zeroize, ZeroizeOnDrop};
 use tokio::time::{interval, MissedTickBehavior};
 use chrono::{Datelike, Utc};
-// use chrono_tz::Asia::Tokyo;
-use chrono_tz::America::Los_Angeles;
+use chrono_tz::Asia::Tokyo;
 
 const GACHA_IGNORE_USER_LIST: [u64; 1] = [757971702658498570];
 
@@ -181,7 +180,7 @@ pub fn perform_gacha_pull<T: Clone + 'static>(
 }
 
 fn is_special_day() -> bool {
-	let now = Utc::now().with_timezone(&Los_Angeles/*&Tokyo*/);
+	let now = Utc::now().with_timezone(&Tokyo);
 
 	// mm/dd
 	let special_days = [
