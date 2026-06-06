@@ -16,6 +16,7 @@ target
 # ENV
 .env
 .env.*
+.venv
 
 # Compiled binary
 /kurenai
