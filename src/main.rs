@@ -1,6 +1,7 @@
 use serenity::{
 	async_trait,
-	builder::GetMessages,
+	builder::{CreateEmbed, CreateMessage, EditChannel, GetMessages},
+	http::Http,
 	model::{
 		channel::*,
 		gateway::Ready,
@@ -25,13 +26,22 @@ use rand::{
 };
 use sha3::{Sha3_512, Digest};
 use zeroize_derive::{Zeroize, ZeroizeOnDrop};
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{interval, sleep, MissedTickBehavior};
 use chrono::{Datelike, Utc};
 use chrono_tz::Asia::Tokyo;
 
 const GACHA_IGNORE_USER_LIST: [u64; 1] = [757971702658498570];
 
 static PULL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+const TRAP_CHANNEL_ID: u64 = 1514678047066951761;
+
+const EVIDENCE_LOG_CHANNEL_ID: u64 = 1514679589534961794;
+
+const DELETE_DELAY_MS: u64 = 1500;
+const BULK_DELETE_DELAY_MS: u64 = 2000;
+const FETCH_DELAY_MS: u64 = 1100;
+const MAX_FETCH_PAGES_PER_CHANNEL: usize = 10;
 
 #[derive(Clone)]
 pub struct RoleGachaDrop {
@@ -116,9 +126,9 @@ impl EntropyState {
 }
 
 pub fn perform_gacha_pull<T: Clone + 'static>(
-	user_id: u64, 
-	message_id: u64, 
-	content: &str, 
+	user_id: u64,
+	message_id: u64,
+	content: &str,
 	pool: &[GachaTier<T>]
 ) -> Option<(&'static str, T)> {
 	let mut state = EntropyState::new();
@@ -151,7 +161,7 @@ pub fn perform_gacha_pull<T: Clone + 'static>(
 	for tier in pool.iter() {
 		let variance = rng.random_range(0..=(tier.jitter * 2));
 		let mutated_weight = (tier.base_weight + variance).saturating_sub(tier.jitter);
-		
+
 		dynamic_pool.push((tier, mutated_weight));
 		total_weight += mutated_weight;
 	}
@@ -217,7 +227,7 @@ fn is_special_day() -> bool {
 		(8, 14),
 		(8, 15),
 		(8, 16),
-		//////////
+		////////
 		(8, 24), // uma jp half anniversary
 		(8, 25), // otsukimi
 		(10, 12), // sports day
@@ -375,6 +385,399 @@ async fn start_sticky_worker(ctx: Context, state: Arc<StickyState>) {
 	}
 }
 
+pub struct OwnersList {
+	pub ids: RwLock<HashSet<u64>>,
+}
+
+struct OwnersKey;
+
+impl TypeMapKey for OwnersKey {
+	type Value = Arc<OwnersList>;
+}
+
+impl OwnersList {
+	pub fn load(&self, path: &str) {
+		if let Ok(file) = File::open(path) {
+			let reader = BufReader::new(file);
+			let mut new_ids = HashSet::new();
+
+			for line in reader.lines().filter_map(Result::ok) {
+				let trimmed = line.trim();
+				if !trimmed.is_empty() {
+					if let Ok(id) = trimmed.parse::<u64>() {
+						new_ids.insert(id);
+					} else {
+						eprintln!("Invalid user ID in {}: '{}'", path, trimmed);
+					}
+				}
+			}
+
+			new_ids.shrink_to_fit();
+
+			let mut write_lock = self.ids.write().unwrap();
+			*write_lock = new_ids;
+			println!("Owners loaded. Total count: {}", write_lock.len());
+		} else {
+			eprintln!("Failed to open {} — owners file not found! No users will be whitelisted from the trap channel.", path);
+		}
+	}
+
+	pub fn contains(&self, id: u64) -> bool {
+		let lock = self.ids.read().unwrap();
+		lock.contains(&id)
+	}
+}
+
+pub struct SafeWordsList {
+	pub words: RwLock<Vec<String>>,
+}
+
+struct SafeWordsKey;
+
+impl TypeMapKey for SafeWordsKey {
+	type Value = Arc<SafeWordsList>;
+}
+
+impl SafeWordsList {
+	pub fn load(&self, path: &str) {
+		if let Ok(file) = File::open(path) {
+			let reader = BufReader::new(file);
+			let mut new_words = Vec::new();
+
+			for line in reader.lines().filter_map(Result::ok) {
+				let trimmed = line.trim();
+				if !trimmed.is_empty() && !trimmed.starts_with('#') {
+					new_words.push(trimmed.to_string());
+				}
+			}
+
+			new_words.shrink_to_fit();
+
+			let mut write_lock = self.words.write().unwrap();
+			*write_lock = new_words;
+			println!("Safe words loaded. Total length: {}", write_lock.len());
+		} else {
+			eprintln!("Failed to open {}, safe-words file not found!", path);
+		}
+	}
+
+	pub fn get_random(&self) -> Option<String> {
+		let lock = self.words.read().unwrap();
+		if lock.is_empty() {
+			return None;
+		}
+		let index: usize = rng_range(0..lock.len());
+		Some(lock[index].clone())
+	}
+}
+
+struct BanTracker {
+	pending: Mutex<HashSet<u64>>,
+}
+
+struct BanTrackerKey;
+
+impl TypeMapKey for BanTrackerKey {
+	type Value = Arc<BanTracker>;
+}
+
+fn channel_has_messages(kind: ChannelType) -> bool {
+	matches!(
+		kind,
+		ChannelType::Text
+		| ChannelType::PublicThread
+		| ChannelType::PrivateThread
+	)
+}
+
+async fn handle_trap_message(ctx: &Context, msg: &Message) {
+	{
+		let data = ctx.data.read().await;
+		let owners = data.get::<OwnersKey>().expect("OwnersKey missing");
+		if owners.contains(msg.author.id.get()) {
+			return;
+		}
+	}
+
+	if msg.webhook_id.is_some() {
+		let webhook_id = msg.webhook_id.unwrap();
+		eprintln!(
+			"Webhook message detected in trap channel from webhook {}. Deleting message & webhook.",
+			webhook_id
+		);
+
+		let _ = send_webhook_evidence(&ctx.http, msg).await;
+
+		let _ = msg.delete(&ctx.http).await;
+
+		if let Err(e) = ctx.http.delete_webhook(webhook_id, None).await {
+			eprintln!("Failed to delete webhook {}: {}", webhook_id, e);
+		}
+
+		rename_trap_channel(ctx).await;
+		return;
+	}
+
+	{
+		let should_skip = {
+			let tracker = {
+				let data = ctx.data.read().await;
+				data.get::<BanTrackerKey>().cloned().expect("BanTracker missing")
+			};
+			let mut pending = tracker.pending.lock().unwrap();
+			if pending.contains(&msg.author.id.get()) {
+				true
+			} else {
+				pending.insert(msg.author.id.get());
+				false
+			}
+		};
+		if should_skip {
+			let _ = msg.delete(&ctx.http).await;
+			return;
+		}
+	}
+
+	let guild_id = match msg.guild_id {
+		Some(id) => id,
+		None => {
+			remove_pending(ctx, msg.author.id).await;
+			return;
+		}
+	};
+
+	let user_id = msg.author.id;
+	let user_name = msg.author.name.clone();
+	let user_display = msg.author.global_name.clone().unwrap_or_else(|| user_name.clone());
+	let avatar_url = msg.author.avatar_url().unwrap_or_default();
+	let content = msg.content.clone();
+	let msg_timestamp = msg.timestamp;
+	let attachments = msg.attachments.clone();
+	let is_bot_user = msg.author.bot;
+
+	send_evidence_embed(&ctx.http, &user_name, &user_display, user_id, &avatar_url, &content, msg_timestamp, &attachments).await;
+
+	let deleted_count = delete_all_user_messages(ctx, guild_id, user_id).await;
+	println!("Purged {} message(s) from scammer {} ({})", deleted_count, user_name, user_id);
+
+	if is_bot_user {
+		eprintln!("Note: user {} is a bot account — attempting ban anyway.", user_id);
+	}
+
+	match guild_id.ban_with_reason(&ctx.http, user_id, 7, "Auto-banned: scam bot detected in trap channel").await {
+		Ok(()) => println!("Banned scam bot: {} ({})", user_name, user_id),
+		Err(e) => {
+			eprintln!("Failed to ban user {} ({}): {}", user_name, user_id, e);
+		}
+	}
+
+	rename_trap_channel(ctx).await;
+	remove_pending(ctx, user_id).await;
+}
+
+async fn remove_pending(ctx: &Context, user_id: UserId) {
+	let data = ctx.data.read().await;
+	let tracker = data.get::<BanTrackerKey>().expect("BanTracker missing");
+	let mut pending = tracker.pending.lock().unwrap();
+	pending.remove(&user_id.get());
+}
+
+async fn send_evidence_embed(
+	http:&Http,
+	name: &str,
+	display: &str,
+	uid: UserId,
+	avatar: &str,
+	content: &str,
+	ts: Timestamp,
+	attachs: &[Attachment],
+) {
+	let log_ch = ChannelId::new(EVIDENCE_LOG_CHANNEL_ID);
+
+	let mut embed = CreateEmbed::new()
+		.title("\u{1F6A8} Scam Bot Detected")
+		.color(0xFF0000)
+		.thumbnail(avatar)
+		.field("Username", name.to_string(), true)
+		.field("Display Name", display.to_string(), true)
+		.field("User ID", uid.to_string(), true)
+		.field("Message Content",
+			if content.is_empty() { "*No text content, likely image-only scam*".to_string() } else { content.to_string() },
+			false
+		)
+		.field("Sent At", ts.to_string(), true);
+
+	if !attachs.is_empty() {
+		let list: Vec<String> = attachs.iter()
+			.map(|a| format!("{} ({} bytes) - {}", a.filename, a.size, a.url))
+			.collect();
+		embed = embed.field("Attachments", list.join("\n"), false);
+	}
+
+	embed = embed
+		.field("Action Taken", "All messages purged + User banned indefinitely", false)
+		.timestamp(Timestamp::now());
+
+	if let Err(e) = log_ch.send_message(http, CreateMessage::new().add_embed(embed)).await {
+		eprintln!("Failed to send evidence embed: {}", e);
+	}
+}
+
+async fn send_webhook_evidence(http: &Http, msg: &Message) -> Result<Message, SerenityError> {
+	let log_ch = ChannelId::new(EVIDENCE_LOG_CHANNEL_ID);
+	let wid = msg.webhook_id.map_or("unknown".to_string(), |id| id.to_string());
+
+	let embed = CreateEmbed::new()
+		.title("\u{1F6A8} Webhook Scam Detected")
+		.color(0xFFAA00)
+		.field("Webhook ID", wid, true)
+		.field("Author", msg.author.name.clone(), true)
+		.field("Content",
+			if msg.content.is_empty() { "*No text*".to_string() } else { msg.content.clone() },
+			false)
+		.field("Action Taken", "Message deleted + Webhook deleted (if possible)", false)
+		.timestamp(Timestamp::now());
+
+	log_ch.send_message(http, CreateMessage::new().add_embed(embed)).await
+}
+
+async fn delete_all_user_messages(ctx: &Context, guild_id: GuildId, user_id: UserId) -> u64 {
+	let channels = match guild_id.channels(&ctx.http).await {
+		Ok(ch) => ch,
+		Err(e) => {
+			eprintln!("Failed to get guild channels: {}", e);
+			return 0;
+		}
+	};
+
+	let mut total_deleted: u64 = 0;
+
+	for (channel_id, channel) in &channels {
+		if !channel_has_messages(channel.kind) {
+			continue;
+		}
+		total_deleted += delete_user_messages_in_channel(&ctx.http, *channel_id, user_id).await;
+	}
+
+	if let Ok(threads_resp) = guild_id.get_active_threads(&ctx.http).await {
+		for thread in &threads_resp.threads {
+			total_deleted += delete_user_messages_in_channel(&ctx.http, thread.id, user_id).await;
+		}
+	}
+
+	total_deleted
+}
+
+async fn delete_user_messages_in_channel(http: &Http, channel_id: ChannelId, user_id: UserId) -> u64 {
+	let mut deleted: u64 = 0;
+	let mut recent_ids: Vec<MessageId> = Vec::new();
+	let mut old_ids: Vec<MessageId> = Vec::new();
+
+	let fourteen_days_ago = Timestamp::now().unix_timestamp() - (14 * 24 * 3600);
+
+	let mut cursor: Option<MessageId> = None;
+
+	for _ in 0..MAX_FETCH_PAGES_PER_CHANNEL {
+		let mut builder = GetMessages::new().limit(100);
+		if let Some(id) = cursor {
+			builder = builder.before(id);
+		}
+
+		let batch = match channel_id.messages(http, builder).await {
+			Ok(msgs) => msgs,
+			Err(e) => {
+				if !e.to_string().contains("50001") && !e.to_string().contains("50013") {
+					eprintln!("Failed to fetch messages from channel {}: {}", channel_id, e);
+				}
+				break;
+			}
+		};
+
+		if batch.is_empty() {
+			break;
+		}
+
+		cursor = batch.last().map(|m| m.id);
+
+		for msg in &batch {
+			if msg.author.id == user_id {
+				if msg.timestamp.unix_timestamp() >= fourteen_days_ago {
+					recent_ids.push(msg.id);
+				} else {
+					old_ids.push(msg.id);
+				}
+			}
+		}
+
+		let oldest_ts = batch.last().map(|m| m.timestamp.unix_timestamp()).unwrap_or(i64::MAX);
+		if oldest_ts < fourteen_days_ago && recent_ids.is_empty() && old_ids.is_empty() {
+			break;
+		}
+
+		sleep(Duration::from_millis(FETCH_DELAY_MS)).await;
+	}
+
+	while recent_ids.len() >= 2 {
+		let end = std::cmp::min(100, recent_ids.len());
+		let batch: Vec<MessageId> = recent_ids.drain(..end).collect();
+
+		match channel_id.delete_messages(http, &batch).await {
+			Ok(()) => deleted += batch.len() as u64,
+			Err(e) => {
+				eprintln!(
+					"Bulk delete failed in channel {} ({} messages): {}. Falling back to individual deletes.",
+					channel_id, batch.len(), e
+				);
+				for id in &batch {
+					if channel_id.delete_message(http, *id).await.is_ok() {
+						deleted += 1;
+					}
+					sleep(Duration::from_millis(DELETE_DELAY_MS)).await;
+				}
+			}
+		}
+
+		sleep(Duration::from_millis(BULK_DELETE_DELAY_MS)).await;
+	}
+
+	for id in recent_ids.into_iter().chain(old_ids.into_iter()) {
+		match channel_id.delete_message(http, id).await {
+			Ok(()) => deleted += 1,
+			Err(e) => {
+				let err_str = e.to_string();
+				if !err_str.contains("10008") {
+					eprintln!("Failed to delete message {} in {}: {}", id, channel_id, e);
+				}
+			}
+		}
+		sleep(Duration::from_millis(DELETE_DELAY_MS)).await;
+	}
+
+	deleted
+}
+
+async fn rename_trap_channel(ctx: &Context) {
+	let safe_words = {
+		let data = ctx.data.read().await;
+		data.get::<SafeWordsKey>().cloned().expect("SafeWordsKey missing")
+	};
+
+	let new_name = match safe_words.get_random() {
+		Some(w) => w,
+		None => {
+			eprintln!("Safe words list is empty, skipping trap channel rename");
+			return;
+		}
+	};
+
+	let channel_id = ChannelId::new(TRAP_CHANNEL_ID);
+
+	match channel_id.edit(&ctx.http, EditChannel::new().name(&new_name)).await {
+		Ok(_) => println!("Renamed trap channel to \"{}\"", new_name),
+		Err(e) => eprintln!("Failed to rename trap channel: {}", e),
+	}
+}
+
 struct Handler;
 
 fn should_show(rate: f64) -> bool {
@@ -399,6 +802,15 @@ impl EventHandler for Handler {
 		let sticky = data.get::<StickyKey>().cloned().expect("StickyState missing");
 		drop(data);
 
+		if msg.channel_id.get() == TRAP_CHANNEL_ID {
+			let ctx_clone = ctx.clone();
+			let msg_clone = msg.clone();
+			tokio::spawn(async move {
+				handle_trap_message(&ctx_clone, &msg_clone).await;
+			});
+			return;
+		}
+
 		let is_phishing = {
 			let bad_links = protect.set.read().unwrap();
 			msg.content.split_whitespace().any(|word| {
@@ -420,7 +832,7 @@ impl EventHandler for Handler {
 				let _ = msg.channel_id.say(&ctx.http, response).await;
 			}
 			return;
-		}		
+		}
 
 		if msg.channel_id.get() == HELP_CHANNEL_ID {
 			let mut should_delete_id = None;
@@ -452,7 +864,7 @@ impl EventHandler for Handler {
 				"<a:Sillymambo:1463878469610897485>",
 				"<:stillinstare:1463878652402860228>"
 			];
-			
+
 			let index: usize = rng_range(0..silly_emojis.len());
 			let emoji = silly_emojis[index];
 			let _ = msg.reply(&ctx.http, emoji).await;
@@ -478,10 +890,10 @@ impl EventHandler for Handler {
 				let role_id_raw = outcome.role_id;
 				let role_id = RoleId::new(role_id_raw);
 				let guild_id = msg.guild_id.unwrap();
-	
+
 				let has_role = msg.member.as_ref()
 					.map_or(false, |m| m.roles.contains(&role_id));
-	
+
 				if !has_role {
 					if let Ok(_) = ctx.http.add_member_role(guild_id, msg.author.id, role_id, Some("Role gacha from Silly bot")).await {
 						if tier_name == "UR" {
@@ -489,7 +901,7 @@ impl EventHandler for Handler {
 								"...Ah. My love... you obtained [UR] {}. As expected of mY destined pErson... Ahh, seeing you so blessed makes my heart buzz... I want to take all of this joy, and... slurp it up... Fufu...",
 								"...Ah! T-Trainer-san... You got [UR] {}! I am... so incredibly glad that such wonderful fortune has found you. To think I am allowed to share this special moment right by your side... Is it really okay... for me to receive this much happiness...?"
 							];
-							
+
 							let index: usize = rng_range(0..ur_messages.len());
 							let response = ur_messages[index].replace("{}", outcome.label);
 							let _ = msg.reply(&ctx.http, response).await;
@@ -498,7 +910,7 @@ impl EventHandler for Handler {
 								"...Congratulations, Trainer-san. You managed to welcome [SSR] {}. Seeing your joyful expression makes me... so very happy, too. ...Please, let me stay by your side and watch you... mooore...",
 								"...Ah... fufu. I'm so happy you got [SSR] {}, my Trainer-san. Seeing how delighted you are... it makes me feel like I am submerged in warm water. ...I hope I can always be here... to share these gentle feelings with you..."
 							];
-							
+
 							let index: usize = rng_range(0..ssr_messages.len());
 							let response = ssr_messages[index].replace("{}", outcome.label);
 							let _ = msg.reply(&ctx.http, response).await;
@@ -528,7 +940,7 @@ impl EventHandler for Handler {
 
 					let log_entry = format!(
 						"Winner: {} ({})\nTime: {}\nWinner Message: {}\nBot Reply: {}\n-------------------\n",
-						msg.author.name, 
+						msg.author.name,
 						msg.author.id,
 						Timestamp::now(),
 						winner_msg_link,
@@ -608,11 +1020,25 @@ async fn main() {
 		last_author_id: Mutex::new(None)
 	});
 
+	let safe_words = Arc::new(SafeWordsList {
+		words: RwLock::new(Vec::new())
+	});
+	safe_words.load("safe_english_words.txt");
+
+	let owners = Arc::new(OwnersList {
+		ids: RwLock::new(HashSet::new())
+	});
+	owners.load("owners.txt");
+
+	let ban_tracker = Arc::new(BanTracker {
+		pending: Mutex::new(HashSet::new())
+	});
+
 	let protect_clone = Arc::clone(&protect);
 	tokio::spawn(async move {
 		start_daily_download(
 			// big thanks to https://github.com/Phishing-Database/Phishing.Database
-			"https://phish.co.za/latest/phishing-links-ACTIVE.txt".to_string(), 
+			"https://phish.co.za/latest/phishing-links-ACTIVE.txt".to_string(),
 			"phishing.txt".to_string(),
 			protect_clone
 		).await;
@@ -633,6 +1059,9 @@ async fn main() {
 		data.insert::<PhishingKey>(protect);
 		data.insert::<StickyKey>(sticky_state);
 		data.insert::<StoryLinesKey>(story_lines);
+		data.insert::<SafeWordsKey>(safe_words);
+		data.insert::<OwnersKey>(owners);
+		data.insert::<BanTrackerKey>(ban_tracker);
 	}
 
 	if let Err(why) = client.start().await {
