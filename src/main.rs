@@ -12,12 +12,12 @@ use serenity::{
 	prelude::*
 };
 use std::{
-	collections::HashSet,
+	collections::{HashMap, HashSet, VecDeque},
 	fs::{self, File},
 	io::{BufRead, BufReader},
 	sync::{Arc, Mutex, RwLock, atomic::{AtomicU64, Ordering}},
 	process::Command,
-	time::{Duration, SystemTime, UNIX_EPOCH}
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH}
 };
 use rand::{
 	RngExt, SeedableRng, TryRng,
@@ -33,6 +33,8 @@ use chrono_tz::Asia::Tokyo;
 const GACHA_IGNORE_USER_LIST: [u64; 1] = [757971702658498570];
 
 static PULL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+const SILLY_CHANNEL: u64 = 1489631089919000636;
 
 const TRAP_CHANNEL_ID: u64 = 1514678047066951761;
 
@@ -283,6 +285,22 @@ impl StoryLines {
 	}
 }
 
+pub struct UserSillyReplyState {
+	pub queue: VecDeque<Message>,
+	pub current_delay: Duration,
+	pub next_allowed_time: Instant,
+}
+
+pub struct SillyReplyQueue {
+	pub users: Mutex<HashMap<u64, UserSillyReplyState>>,
+}
+
+struct SillyReplyQueueKey;
+
+impl TypeMapKey for SillyReplyQueueKey {
+	type Value = Arc<SillyReplyQueue>;
+}
+
 
 pub struct PhishingProtect {
 	pub set: RwLock<HashSet<String>>
@@ -325,6 +343,45 @@ struct StickyState {
 struct StickyKey;
 impl TypeMapKey for StickyKey {
 	type Value = Arc<StickyState>;
+}
+
+async fn start_story_worker(ctx: Context, state: Arc<SillyReplyQueue>) {
+	let mut interval = interval(Duration::from_millis(500)); // tick frequently to check all users
+	loop {
+		interval.tick().await;
+
+		let mut msg_to_send = None;
+
+		{
+			let mut users = state.users.lock().unwrap();
+			let now = Instant::now();
+
+			for (_, user_state) in users.iter_mut() {
+				// find the first user who has a message ready and has passed their timeout
+				if !user_state.queue.is_empty() && now >= user_state.next_allowed_time {
+					msg_to_send = user_state.queue.pop_front();
+
+					// increase the delay for their NEXT message to punish spam
+					// adds 2 seconds each time, capped at 30 seconds maximum wait
+					user_state.current_delay = (user_state.current_delay + Duration::from_secs(2))
+						.min(Duration::from_secs(30));
+
+					user_state.next_allowed_time = now + user_state.current_delay;
+					break; // only process one message across all users per global tick to prevent API rate limits
+				}
+			}
+		}
+
+		if let Some(msg) = msg_to_send {
+			let data = ctx.data.read().await;
+			let stories = data.get::<StoryLinesKey>().cloned().expect("StoryLines missing");
+			drop(data);
+
+			if let Some(random_quote) = stories.get_random() {
+				let _ = msg.reply(&ctx.http, random_quote).await;
+			}
+		}
+	}
 }
 
 const HELP_CHANNEL_ID: u64 = 1248143441242619955;
@@ -873,15 +930,34 @@ impl EventHandler for Handler {
 			}
 		}
 
-		// 0.01% on help channel, 0.5% on all channels
-		let msg_rate = if msg.channel_id.get() == HELP_CHANNEL_ID { 0.0001 } else { 0.005 };
-		if should_show(msg_rate) {
+		if msg.channel_id.get() == SILLY_CHANNEL {
 			let data = ctx.data.read().await;
-			let stories = data.get::<StoryLinesKey>().cloned().expect("StoryLines missing");
+			let queue_state = data.get::<SillyReplyQueueKey>().cloned().expect("SillyReplyQueue missing");
 			drop(data);
 
-			if let Some(random_quote) = stories.get_random() {
-				let _ = msg.reply(&ctx.http, random_quote).await;
+			let mut users = queue_state.users.lock().unwrap();
+			let state = users.entry(msg.author.id.get()).or_insert_with(|| UserSillyReplyState {
+				queue: VecDeque::new(),
+				current_delay: Duration::from_secs(2),
+				next_allowed_time: Instant::now(),
+			});
+
+			// if the user's queue is empty, check if they've been idle to reset their delays
+			if state.queue.is_empty() {
+				let now = Instant::now();
+				if now > state.next_allowed_time {
+					// if they haven't sent a message in over 10s past their last timeout, fully reset their delay
+					if now.duration_since(state.next_allowed_time) > Duration::from_secs(10) {
+						state.current_delay = Duration::from_secs(2);
+					}
+					// apply their current delay starting from NOW
+					state.next_allowed_time = now + state.current_delay;
+				}
+			}
+
+			// hard-capped at 10,000 to prevent malicious out-of-memory attacks
+			if state.queue.len() < 10_000 {
+				state.queue.push_back(msg.clone());
 			}
 		}
 
@@ -959,6 +1035,7 @@ impl EventHandler for Handler {
 		println!("{} is connected!", ready.user.name);
 		let data = ctx.data.read().await;
 		let sticky_state = data.get::<StickyKey>().cloned().expect("StickyKey missing");
+		let story_queue = data.get::<SillyReplyQueueKey>().cloned().expect("SillyReplyQueue missing");
 
 		if sticky_state.enabled {
 			let ctx_clone = ctx.clone();
@@ -966,6 +1043,11 @@ impl EventHandler for Handler {
 				start_sticky_worker(ctx_clone, sticky_state).await;
 			});
 		}
+
+		let ctx_clone2 = ctx.clone();
+		tokio::spawn(async move {
+			start_story_worker(ctx_clone2, story_queue).await;
+		});
 	}
 }
 
@@ -1014,6 +1096,10 @@ async fn main() {
 	});
 	story_lines.load("chara_story_lines.txt");
 
+	let story_queue = Arc::new(SillyReplyQueue {
+		users: Mutex::new(HashMap::new())
+	});
+
 	let sticky_state = Arc::new(StickyState {
 		enabled: false,
 		last_sticky_id: Mutex::new(None),
@@ -1059,6 +1145,7 @@ async fn main() {
 		data.insert::<PhishingKey>(protect);
 		data.insert::<StickyKey>(sticky_state);
 		data.insert::<StoryLinesKey>(story_lines);
+		data.insert::<SillyReplyQueueKey>(story_queue);
 		data.insert::<SafeWordsKey>(safe_words);
 		data.insert::<OwnersKey>(owners);
 		data.insert::<BanTrackerKey>(ban_tracker);
