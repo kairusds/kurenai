@@ -475,7 +475,7 @@ impl OwnersList {
 			*write_lock = new_ids;
 			println!("Owners loaded. Total count: {}", write_lock.len());
 		} else {
-			eprintln!("Failed to open {} — owners file not found! No users will be whitelisted from the trap channel.", path);
+			eprintln!("Failed to open {}, owners file not found! No users will be whitelisted from the trap channel.", path);
 		}
 	}
 
@@ -618,11 +618,17 @@ async fn handle_trap_message(ctx: &Context, msg: &Message) {
 	println!("Purged {} message(s) from scammer {} ({})", deleted_count, user_name, user_id);
 
 	if is_bot_user {
-		eprintln!("Note: user {} is a bot account — attempting ban anyway.", user_id);
+		eprintln!("Note: user {} is a bot account, attempting ban anyway.", user_id);
 	}
 
 	match guild_id.ban_with_reason(&ctx.http, user_id, 7, "Auto-banned: scam bot detected in trap channel").await {
-		Ok(()) => println!("Banned scam bot: {} ({})", user_name, user_id),
+		Ok(()) => {
+			println!("Banned scam bot: {} ({})", user_name, user_id);
+			let appeal_text = "You have been banned by our anti-bot system. If this was a mistake, please appeal it here: https://appeal.gg/YjBgmuqqYr";
+			if let Err(e) = msg.author.direct_message(&ctx.http, CreateMessage::new().content(appeal_text)).await {
+				eprintln!("Failed to send appeal DM to user {} ({}): {}", user_name, user_id, e);
+			}
+		},
 		Err(e) => {
 			eprintln!("Failed to ban user {} ({}): {}", user_name, user_id, e);
 		}
