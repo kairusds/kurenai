@@ -378,7 +378,8 @@ async fn start_story_worker(ctx: Context, state: Arc<SillyReplyQueue>) {
 			drop(data);
 
 			if let Some(random_quote) = stories.get_random() {
-				let _ = msg.reply(&ctx.http, random_quote).await;
+				let final_quote = random_quote.replace("<chrname>", &msg.author.name);
+				let _ = msg.reply(&ctx.http, final_quote).await;
 			}
 		}
 	}
