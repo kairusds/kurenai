@@ -258,7 +258,7 @@ impl StoryLines {
 			let reader = BufReader::new(file);
 			let mut new_lines = Vec::new();
 
-			for line in reader.lines().filter_map(Result::ok) {
+			for line in reader.lines().map_while(Result::ok) {
 				let trimmed = line.trim();
 				if !trimmed.is_empty() {
 					new_lines.push(trimmed.to_string());
@@ -318,7 +318,7 @@ impl PhishingProtect {
 			let reader = BufReader::new(file);
 			let mut new_set = HashSet::new();
 
-			for line in reader.lines().filter_map(Result::ok) {
+			for line in reader.lines().map_while(Result::ok) {
 				let trimmed = line.trim();
 				if !trimmed.is_empty() {
 					new_set.insert(trimmed.to_lowercase());
@@ -421,11 +421,9 @@ async fn start_sticky_worker(ctx: Context, state: Arc<StickyState>) {
 
 			{
 				let mut id_lock = state.last_sticky_id.lock().unwrap();
-				if duration_since_last_msg >= 120 {
-					if id_lock.map_or(true, |id| id != last_msg.id) {
-						should_delete_id = id_lock.take();
-						should_post = true;
-					}
+				if duration_since_last_msg >= 120 && id_lock.is_none_or(|id| id != last_msg.id) {
+					should_delete_id = id_lock.take();
+					should_post = true;
 				}
 			}
 
@@ -459,7 +457,7 @@ impl OwnersList {
 			let reader = BufReader::new(file);
 			let mut new_ids = HashSet::new();
 
-			for line in reader.lines().filter_map(Result::ok) {
+			for line in reader.lines().map_while(Result::ok) {
 				let trimmed = line.trim();
 				if !trimmed.is_empty() {
 					if let Ok(id) = trimmed.parse::<u64>() {
@@ -502,7 +500,7 @@ impl SafeWordsList {
 			let reader = BufReader::new(file);
 			let mut new_words = Vec::new();
 
-			for line in reader.lines().filter_map(Result::ok) {
+			for line in reader.lines().map_while(Result::ok) {
 				let trimmed = line.trim();
 				if !trimmed.is_empty() && !trimmed.starts_with('#') {
 					new_words.push(trimmed.to_string());
@@ -558,22 +556,21 @@ async fn handle_trap_message(ctx: &Context, msg: &Message) {
 	}
 
 	if msg.webhook_id.is_some() {
-		let webhook_id = msg.webhook_id.unwrap();
-		eprintln!(
-			"Webhook message detected in trap channel from webhook {}. Deleting message & webhook.",
-			webhook_id
-		);
+		if let Some(webhook_id) = msg.webhook_id {
+			eprintln!(
+				"Webhook message detected in trap channel from webhook {}. Deleting message & webhook.",
+				webhook_id
+			);
+			let _ = send_webhook_evidence(&ctx.http, msg).await;
+			let _ = msg.delete(&ctx.http).await;
 
-		let _ = send_webhook_evidence(&ctx.http, msg).await;
+			if let Err(e) = ctx.http.delete_webhook(webhook_id, None).await {
+				eprintln!("Failed to delete webhook {}: {}", webhook_id, e);
+			}
 
-		let _ = msg.delete(&ctx.http).await;
-
-		if let Err(e) = ctx.http.delete_webhook(webhook_id, None).await {
-			eprintln!("Failed to delete webhook {}: {}", webhook_id, e);
+			rename_trap_channel(ctx).await;
+			return;
 		}
-
-		rename_trap_channel(ctx).await;
-		return;
 	}
 
 	{
@@ -645,6 +642,7 @@ async fn remove_pending(ctx: &Context, user_id: UserId) {
 	pending.remove(&user_id.get());
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_evidence_embed(
 	http:&Http,
 	name: &str,
@@ -803,7 +801,7 @@ async fn delete_user_messages_in_channel(http: &Http, channel_id: ChannelId, use
 		sleep(Duration::from_millis(BULK_DELETE_DELAY_MS)).await;
 	}
 
-	for id in recent_ids.into_iter().chain(old_ids.into_iter()) {
+	for id in recent_ids.into_iter().chain(old_ids) {
 		match channel_id.delete_message(http, id).await {
 			Ok(()) => deleted += 1,
 			Err(e) => {
@@ -856,7 +854,7 @@ impl EventHandler for Handler {
 	async fn message(&self, ctx: Context, msg: Message) {
 		let target_guild_id = 1248085334861025350; // hachimi project official server
 
-		if msg.author.bot || msg.guild_id.map_or(true, |id| id.get() != target_guild_id) {
+		if msg.author.bot || msg.guild_id.is_none_or(|id| id.get() != target_guild_id) {
 			return;
 		}
 
@@ -973,34 +971,31 @@ impl EventHandler for Handler {
 				let role_id = RoleId::new(role_id_raw);
 				let guild_id = msg.guild_id.unwrap();
 
-				let has_role = msg.member.as_ref()
-					.map_or(false, |m| m.roles.contains(&role_id));
+				let has_role = msg.member.as_ref().is_some_and(|m| m.roles.contains(&role_id));
 
-				if !has_role {
-					if let Ok(_) = ctx.http.add_member_role(guild_id, msg.author.id, role_id, Some("Role gacha from Silly bot")).await {
-						if tier_name == "UR" {
-							let ur_messages = [
-								"...Ah. My love... you obtained [UR] {}. As expected of mY destined pErson... Ahh, seeing you so blessed makes my heart buzz... I want to take all of this joy, and... slurp it up... Fufu...",
-								"...Ah! T-Trainer-san... You got [UR] {}! I am... so incredibly glad that such wonderful fortune has found you. To think I am allowed to share this special moment right by your side... Is it really okay... for me to receive this much happiness...?"
-							];
+				if !has_role && ctx.http.add_member_role(guild_id, msg.author.id, role_id, Some("Role gacha from Silly bot")).await.is_ok() {
+					if tier_name == "UR" {
+						let ur_messages = [
+							"...Ah. My love... you obtained [UR] {}. As expected of mY destined pErson... Ahh, seeing you so blessed makes my heart buzz... I want to take all of this joy, and... slurp it up... Fufu...",
+							"...Ah! T-Trainer-san... You got [UR] {}! I am... so incredibly glad that such wonderful fortune has found you. To think I am allowed to share this special moment right by your side... Is it really okay... for me to receive this much happiness...?"
+						];
 
-							let index: usize = rng_range(0..ur_messages.len());
-							let response = ur_messages[index].replace("{}", outcome.label);
-							let _ = msg.reply(&ctx.http, response).await;
-						} else if tier_name == "SSR" {
-							let ssr_messages = [
-								"...Congratulations, Trainer-san. You managed to welcome [SSR] {}. Seeing your joyful expression makes me... so very happy, too. ...Please, let me stay by your side and watch you... mooore...",
-								"...Ah... fufu. I'm so happy you got [SSR] {}, my Trainer-san. Seeing how delighted you are... it makes me feel like I am submerged in warm water. ...I hope I can always be here... to share these gentle feelings with you..."
-							];
+						let index: usize = rng_range(0..ur_messages.len());
+						let response = ur_messages[index].replace("{}", outcome.label);
+						let _ = msg.reply(&ctx.http, response).await;
+					} else if tier_name == "SSR" {
+						let ssr_messages = [
+							"...Congratulations, Trainer-san. You managed to welcome [SSR] {}. Seeing your joyful expression makes me... so very happy, too. ...Please, let me stay by your side and watch you... mooore...",
+							"...Ah... fufu. I'm so happy you got [SSR] {}, my Trainer-san. Seeing how delighted you are... it makes me feel like I am submerged in warm water. ...I hope I can always be here... to share these gentle feelings with you..."
+						];
 
-							let index: usize = rng_range(0..ssr_messages.len());
-							let response = ssr_messages[index].replace("{}", outcome.label);
-							let _ = msg.reply(&ctx.http, response).await;
-						} else if tier_name == "SR" {
-							let _ = msg.reply(&ctx.http, format!("...My, you got [SR] {}. That is wonderful, isn't it. ...Fufu, whether the result is grand or modest, as long as I can share this time with you... I feel like I can be alright.", outcome.label)).await;
-						} else if tier_name == "R" {
-							let _ = msg.reply(&ctx.http, format!("...You received [R] {}. Please do not be discouraged... Even if fortune did not favor you this time... I am right here. I will accept everything about you, so... please, let me comfort you...", outcome.label)).await;
-						}
+						let index: usize = rng_range(0..ssr_messages.len());
+						let response = ssr_messages[index].replace("{}", outcome.label);
+						let _ = msg.reply(&ctx.http, response).await;
+					} else if tier_name == "SR" {
+						let _ = msg.reply(&ctx.http, format!("...My, you got [SR] {}. That is wonderful, isn't it. ...Fufu, whether the result is grand or modest, as long as I can share this time with you... I feel like I can be alright.", outcome.label)).await;
+					} else if tier_name == "R" {
+						let _ = msg.reply(&ctx.http, format!("...You received [R] {}. Please do not be discouraged... Even if fortune did not favor you this time... I am right here. I will accept everything about you, so... please, let me comfort you...", outcome.label)).await;
 					}
 				}
 			}
