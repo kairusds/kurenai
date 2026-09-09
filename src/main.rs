@@ -1,8 +1,19 @@
 use serenity::{
 	async_trait,
-	builder::{CreateEmbed, CreateMessage, EditChannel, GetMessages},
+	builder::{
+		CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateEmbed,
+		CreateEmbedAuthor, CreateEmbedFooter, CreateInputText, CreateInteractionResponse,
+		CreateInteractionResponseMessage, CreateMessage, CreateModal, CreateSelectMenu,
+		CreateSelectMenuKind, CreateSelectMenuOption, EditChannel, EditInteractionResponse,
+		GetMessages
+	},
 	http::Http,
 	model::{
+		application::{
+			ActionRowComponent, ButtonStyle, CommandInteraction,
+			ComponentInteraction, ComponentInteractionDataKind, CommandType,
+			InputTextStyle, Interaction, ModalInteraction
+		},
 		channel::*,
 		gateway::Ready,
 		id::*,
@@ -14,11 +25,13 @@ use serenity::{
 use std::{
 	collections::{HashMap, HashSet, VecDeque},
 	fs::{self, File},
-	io::{BufRead, BufReader},
+	io::{BufRead, BufReader, Cursor},
 	sync::{Arc, Mutex, RwLock, atomic::{AtomicU64, Ordering}},
 	process::Command,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH}
 };
+use image::{ExtendedColorType, ImageFormat, ImageReader, codecs::webp::WebPEncoder};
+use tokio::time::{interval, timeout, MissedTickBehavior};
 use rand::{
 	RngExt, SeedableRng, TryRng,
 	distr::uniform::{SampleRange, SampleUniform},
@@ -26,93 +39,51 @@ use rand::{
 };
 use sha3::{Sha3_512, Digest};
 use zeroize_derive::{Zeroize, ZeroizeOnDrop};
-use tokio::time::{interval, sleep, MissedTickBehavior};
 use chrono::{Datelike, Utc};
 use chrono_tz::Asia::Tokyo;
 
-const GACHA_IGNORE_USER_LIST: [u64; 1] = [757971702658498570];
+mod consts;
+use consts::*;
 
 static PULL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-const SILLY_CHANNEL: u64 = 1489631089919000636;
-
-const TRAP_CHANNEL_ID: u64 = 1542348226630262854;
-
-const EVIDENCE_LOG_CHANNEL_ID: u64 = 1514679589534961794;
-
-const DELETE_DELAY_MS: u64 = 1500;
-const BULK_DELETE_DELAY_MS: u64 = 2000;
-const FETCH_DELAY_MS: u64 = 1100;
-const MAX_FETCH_PAGES_PER_CHANNEL: usize = 10;
-
-#[derive(Clone)]
-pub struct RoleGachaDrop {
-	pub role_id: u64,
-	pub label: &'static str,
+fn parse_env<T>(key: &str) -> T where
+	T: std::str::FromStr,
+	T::Err: std::fmt::Display {
+	let val = std::env::var(key).unwrap_or_else(|_| panic!("Missing environment variable: {key}"));
+	val.parse().unwrap_or_else(|e| panic!("Failed to parse {key} ({val:?}): {e}"))
 }
 
-#[derive(Clone)]
-pub struct SpecialGachaDrop {
-	pub prize: &'static str,
-	pub message: &'static str,
+fn parse_env_list<T>(key: &str) -> Vec<T> where
+	T: std::str::FromStr,
+	T::Err: std::fmt::Display {
+	let val = std::env::var(key).unwrap_or_else(|_| panic!("Missing environment variable: {key}"));
+	val.split(',')
+		.map(|s| s.trim())
+		.filter(|s| !s.is_empty())
+		.map(|s| s.parse().unwrap_or_else(|e| panic!("Failed to parse item in {key} ({s:?}): {e}")))
+		.collect()
 }
 
-const UR_SPECIAL_DROPS: &[SpecialGachaDrop] = &[
-	SpecialGachaDrop { prize: "basic_nitro", message: "Yes... but I am not afraid. As long as I am with you, no matter what path it may be...
-...--Therefore, please do not fear, either.
-...Someday, will you expose... more of yourself to me?
-<@757971702658498570>" },
-];
-
-const SPECIAL_GACHA_POOL: [GachaTier<SpecialGachaDrop>; 5] =[
-	GachaTier { tier_name: "UR", base_weight: 5, jitter: 2, drops: UR_SPECIAL_DROPS },
-	GachaTier { tier_name: "SSR", base_weight: 750, jitter: 150, drops: &[] },
-	GachaTier { tier_name: "R", base_weight: 556, jitter: 80, drops: &[] },
-	GachaTier { tier_name: "SR", base_weight: 191, jitter: 40, drops: &[] },
-	GachaTier { tier_name: "草", base_weight: 98498, jitter: 5000, drops: &[] },
-];
-
-pub struct GachaTier<T: 'static> {
-	pub tier_name: &'static str,
-	pub base_weight: u32,
-	pub jitter: u32,
-	pub drops: &'static [T]
+pub struct BotConfig {
+	pub target_guild_id: u64,
+	pub trap_channel_id: u64,
+	pub evidence_log_channel_id: u64,
+	pub silly_channel_id: u64,
+	pub help_channel_id: u64,
+	pub gacha_ignore_user_id: u64,
+	pub appeal_url: String,
+	pub sticky_enabled: bool,
+	pub owner_ids: HashSet<u64>,
+	pub phishing_emojis: Vec<String>,
+	pub silly_emojis: Vec<String>,
 }
 
-const SSR_ROLE_DROPS: &[RoleGachaDrop] = &[
-	RoleGachaDrop { role_id: 1488672805024436344, label: "SS+" },
-	RoleGachaDrop { role_id: 1488672138121580675, label: "SS" },
-	RoleGachaDrop { role_id: 1488672215024009298, label: "S+" },
-	RoleGachaDrop { role_id: 1488673139427770398, label: "S" },
-	RoleGachaDrop { role_id: 1488695883892523179, label: "A+" },
-	RoleGachaDrop { role_id: 1488695909301620827, label: "A" },
-];
+struct ConfigKey;
 
-const UR_ROLE_DROPS: &[RoleGachaDrop] = &[
-	RoleGachaDrop { role_id: 1488672177937977435, label: "UF" },
-	RoleGachaDrop { role_id: 1488672678440075354, label: "UG9" },
-	RoleGachaDrop { role_id: 1488672713005596682, label: "UG" },
-];
-
-const SR_ROLE_DROPS: &[RoleGachaDrop] = &[
-	RoleGachaDrop { role_id: 1488672903468941502, label: "B" },
-	RoleGachaDrop { role_id: 1488672484411703396, label: "C" },
-];
-
-const R_ROLE_DROPS: &[RoleGachaDrop] = &[
-	RoleGachaDrop { role_id: 1488672445358411848, label: "D" },
-	RoleGachaDrop { role_id: 1488673341798613022, label: "E" },
-	RoleGachaDrop { role_id: 1488672878130892920, label: "F" },
-	RoleGachaDrop { role_id: 1488673384777912402, label: "G" },
-];
-
-const ROLE_GACHA_POOL: [GachaTier<RoleGachaDrop>; 5] =[
-	GachaTier { tier_name: "UR", base_weight: 5, jitter: 2, drops: UR_ROLE_DROPS },
-	GachaTier { tier_name: "SSR", base_weight: 750, jitter: 150, drops: SSR_ROLE_DROPS },
-	GachaTier { tier_name: "R", base_weight: 556, jitter: 80, drops: R_ROLE_DROPS },
-	GachaTier { tier_name: "SR", base_weight: 191, jitter: 40, drops: SR_ROLE_DROPS },
-	GachaTier { tier_name: "草", base_weight: 98498, jitter: 5000, drops: &[] },
-];
+impl TypeMapKey for ConfigKey {
+	type Value = Arc<BotConfig>;
+}
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 struct EntropyState {
@@ -356,7 +327,7 @@ async fn start_story_worker(ctx: Context, state: Arc<SillyReplyQueue>) {
 			let mut users = state.users.lock().unwrap();
 			let now = Instant::now();
 
-			for (_, user_state) in users.iter_mut() {
+			for user_state in users.values_mut() {
 				// find the first user who has a message ready and has passed their timeout
 				if !user_state.queue.is_empty() && now >= user_state.next_allowed_time {
 					msg_to_send = user_state.queue.pop_front();
@@ -385,19 +356,12 @@ async fn start_story_worker(ctx: Context, state: Arc<SillyReplyQueue>) {
 	}
 }
 
-const HELP_CHANNEL_ID: u64 = 1248143441242619955;
-const STICKY_MESSAGE: &str = r#"# :warning: BEFORE ASKING A QUESTION :warning:
-- Having runtime errors? Install [Hachimi Edge](https://hachimi.noccu.art).
-- Check for your issue in [Troubleshooting](https://hachimi.noccu.art/docs/hachimi/troubleshooting) or the [FAQ](https://hachimi.noccu.art/docs/hachimi/faqs).
-- Check the pins and backread messsages in this channel.
-
-You will be intentionally ignored if the sources mentioned above cover your issue.
-Still can't find the solution for your problem? Ping the `@Helpdesk` role.
-Bugs instead of tech issue? Check <#1248143380437930085>."#;
-
 async fn start_sticky_worker(ctx: Context, state: Arc<StickyState>) {
 	let mut interval = interval(Duration::from_secs(10));
-	let channel_id = ChannelId::new(HELP_CHANNEL_ID);
+	let channel_id = {
+		let data = ctx.data.read().await;
+		ChannelId::new(data.get::<ConfigKey>().expect("ConfigKey missing").help_channel_id)
+	};
 
 	loop {
 		interval.tick().await;
@@ -438,49 +402,6 @@ async fn start_sticky_worker(ctx: Context, state: Arc<StickyState>) {
 				}
 			}
 		}
-	}
-}
-
-pub struct OwnersList {
-	pub ids: RwLock<HashSet<u64>>,
-}
-
-struct OwnersKey;
-
-impl TypeMapKey for OwnersKey {
-	type Value = Arc<OwnersList>;
-}
-
-impl OwnersList {
-	pub fn load(&self, path: &str) {
-		if let Ok(file) = File::open(path) {
-			let reader = BufReader::new(file);
-			let mut new_ids = HashSet::new();
-
-			for line in reader.lines().map_while(Result::ok) {
-				let trimmed = line.trim();
-				if !trimmed.is_empty() {
-					if let Ok(id) = trimmed.parse::<u64>() {
-						new_ids.insert(id);
-					} else {
-						eprintln!("Invalid user ID in {}: '{}'", path, trimmed);
-					}
-				}
-			}
-
-			new_ids.shrink_to_fit();
-
-			let mut write_lock = self.ids.write().unwrap();
-			*write_lock = new_ids;
-			println!("Owners loaded. Total count: {}", write_lock.len());
-		} else {
-			eprintln!("Failed to open {}, owners file not found! No users will be whitelisted from the trap channel.", path);
-		}
-	}
-
-	pub fn contains(&self, id: u64) -> bool {
-		let lock = self.ids.read().unwrap();
-		lock.contains(&id)
 	}
 }
 
@@ -537,22 +458,186 @@ impl TypeMapKey for BanTrackerKey {
 	type Value = Arc<BanTracker>;
 }
 
-fn channel_has_messages(kind: ChannelType) -> bool {
+struct CdnClientKey;
+
+impl TypeMapKey for CdnClientKey {
+	type Value = Arc<reqwest::Client>;
+}
+
+pub struct SayDraft {
+	channel_id: ChannelId,
+	title: String,
+	description: String,
+	color: Option<u32>,
+	image_url: String,
+	thumbnail_url: String,
+	author_name: String,
+	author_url: String,
+	author_icon_url: String,
+	footer_text: String,
+	footer_icon_url: String,
+	fields: Vec<(String, String, bool)>,
+}
+
+impl SayDraft {
+	fn new(channel_id: ChannelId) -> Self {
+		Self {
+			channel_id,
+			title: String::new(),
+			description: String::new(),
+			color: None,
+			image_url: String::new(),
+			thumbnail_url: String::new(),
+			author_name: String::new(),
+			author_url: String::new(),
+			author_icon_url: String::new(),
+			footer_text: String::new(),
+			footer_icon_url: String::new(),
+			fields: Vec::new(),
+		}
+	}
+
+	fn is_empty(&self) -> bool {
+		self.title.is_empty()
+			&& self.description.is_empty()
+			&& self.image_url.is_empty()
+			&& self.thumbnail_url.is_empty()
+			&& self.author_name.is_empty()
+			&& self.footer_text.is_empty()
+			&& self.fields.is_empty()
+	}
+
+	fn total_len(&self) -> usize {
+		self.title.chars().count()
+			+ self.description.chars().count()
+			+ self.author_name.chars().count()
+			+ self.footer_text.chars().count()
+			+ self
+				.fields
+				.iter()
+				.map(|(name, value, _)| name.chars().count() + value.chars().count())
+				.sum::<usize>()
+	}
+
+	fn embed(&self) -> CreateEmbed {
+		let mut embed = CreateEmbed::new();
+
+		if !self.title.is_empty() {
+			embed = embed.title(self.title.as_str());
+		}
+		if !self.description.is_empty() {
+			embed = embed.description(self.description.as_str());
+		}
+		if let Some(color) = self.color {
+			embed = embed.color(color);
+		}
+		if !self.image_url.is_empty() {
+			embed = embed.image(self.image_url.as_str());
+		}
+		if !self.thumbnail_url.is_empty() {
+			embed = embed.thumbnail(self.thumbnail_url.as_str());
+		}
+		if !self.author_name.is_empty() {
+			let mut author = CreateEmbedAuthor::new(self.author_name.as_str());
+			if !self.author_url.is_empty() {
+				author = author.url(self.author_url.as_str());
+			}
+			if !self.author_icon_url.is_empty() {
+				author = author.icon_url(self.author_icon_url.as_str());
+			}
+			embed = embed.author(author);
+		}
+		if !self.footer_text.is_empty() {
+			let mut footer = CreateEmbedFooter::new(self.footer_text.as_str());
+			if !self.footer_icon_url.is_empty() {
+				footer = footer.icon_url(self.footer_icon_url.as_str());
+			}
+			embed = embed.footer(footer);
+		}
+		for (name, value, inline) in &self.fields {
+			embed = embed.field(name.as_str(), value.as_str(), *inline);
+		}
+
+		embed
+	}
+}
+
+pub struct SayBuilder {
+	drafts: Mutex<HashMap<u64, SayDraft>>,
+}
+
+struct SayBuilderKey;
+
+impl TypeMapKey for SayBuilderKey {
+	type Value = Arc<SayBuilder>;
+}
+
+fn parse_hex_color(input: &str) -> Option<u32> {
+	let trimmed = input.trim().trim_start_matches('#');
+	if trimmed.len() != 6 {
+		return None;
+	}
+	u32::from_str_radix(trimmed, 16).ok()
+}
+
+fn is_http_url(url: &str) -> bool {
+	url.starts_with("https://") || url.starts_with("http://")
+}
+
+fn parse_inline_flag(input: &str) -> bool {
 	matches!(
-		kind,
-		ChannelType::Text
-		| ChannelType::PublicThread
-		| ChannelType::PrivateThread
+		input.trim().to_ascii_lowercase().as_str(),
+		"y" | "yes" | "true" | "1"
 	)
 }
 
-async fn handle_trap_message(ctx: &Context, msg: &Message) {
-	{
-		let data = ctx.data.read().await;
-		let owners = data.get::<OwnersKey>().expect("OwnersKey missing");
-		if owners.contains(msg.author.id.get()) {
-			return;
+fn is_image_attachment(attachment: &Attachment) -> bool {
+	attachment
+		.content_type
+		.as_deref()
+		.is_some_and(|kind| kind.starts_with("image/"))
+}
+
+fn is_cdn_url(url: &str) -> bool {
+	reqwest::Url::parse(url)
+		.ok()
+		.and_then(|parsed| parsed.host_str().map(|host| CDN_ALLOWED_HOSTS.contains(&host)))
+		.unwrap_or(false)
+}
+
+fn sniff_raster_format(bytes: &[u8]) -> Option<ImageFormat> {
+	if bytes.len() < 12 {
+		return None;
+	}
+	match bytes {
+		[0xFF, 0xD8, 0xFF, ..] => Some(ImageFormat::Jpeg),
+		[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, ..] => Some(ImageFormat::Png),
+		[b'G', b'I', b'F', b'8', b'7' | b'9', b'a', ..] => Some(ImageFormat::Gif),
+		[b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => {
+			Some(ImageFormat::WebP)
 		}
+		_ => None,
+	}
+}
+
+fn modal_value<'a>(modal: &'a ModalInteraction, custom_id: &str) -> Option<&'a str> {
+	modal.data.components.iter().find_map(|row| {
+		row.components.iter().find_map(|component| match component {
+			ActionRowComponent::InputText(input) if input.custom_id == custom_id => {
+				Some(input.value.as_deref().unwrap_or(""))
+			}
+			_ => None,
+		})
+	})
+}
+
+async fn handle_trap_message(ctx: &Context, msg: &Message) {
+	let config = {
+		let data = ctx.data.read().await;
+		data.get::<ConfigKey>().cloned().expect("ConfigKey missing")
+	};
+	if config.owner_ids.contains(&msg.author.id.get()) {
+		return;
 	}
 
 	if msg.webhook_id.is_some() {
@@ -561,7 +646,7 @@ async fn handle_trap_message(ctx: &Context, msg: &Message) {
 				"Webhook message detected in trap channel from webhook {}. Deleting message & webhook.",
 				webhook_id
 			);
-			let _ = send_webhook_evidence(&ctx.http, msg).await;
+			let _ = send_webhook_evidence(ctx, msg).await;
 			let _ = msg.delete(&ctx.http).await;
 
 			if let Err(e) = ctx.http.delete_webhook(webhook_id, None).await {
@@ -610,16 +695,19 @@ async fn handle_trap_message(ctx: &Context, msg: &Message) {
 	let attachments = msg.attachments.clone();
 	let is_bot_user = msg.author.bot;
 
-	send_evidence_embed(&ctx.http, &user_name, &user_display, user_id, &avatar_url, &content, msg_timestamp, &attachments).await;
-
-	let deleted_count = delete_all_user_messages(ctx, guild_id, user_id).await;
+	let (deleted_count, _) = tokio::join!(
+		delete_all_user_messages(ctx, guild_id, user_id),
+		send_evidence_embed(ctx, &user_name, &user_display, user_id, &avatar_url, &content, msg_timestamp, &attachments),
+	);
 	println!("Purged {} message(s) from scammer {} ({})", deleted_count, user_name, user_id);
 
 	if is_bot_user {
 		eprintln!("Note: user {} is a bot account, attempting ban anyway.", user_id);
 	}
 
-	let appeal_text = "You have been banned by our anti-bot system. If this was a mistake, please appeal it here: https://appeal.gg/YjBgmuqqYr";
+	let appeal_url = &config.appeal_url;
+	let appeal_text = format!("You have been banned by our anti-bot system. If this was a mistake, please appeal it here: {}", appeal_url);
+
 	if let Err(e) = msg.author.direct_message(&ctx.http, CreateMessage::new().content(appeal_text)).await {
 		eprintln!("Failed to send appeal DM to user {} ({}): {}", user_name, user_id, e);
 	}
@@ -644,7 +732,7 @@ async fn remove_pending(ctx: &Context, user_id: UserId) {
 
 #[allow(clippy::too_many_arguments)]
 async fn send_evidence_embed(
-	http:&Http,
+	ctx: &Context,
 	name: &str,
 	display: &str,
 	uid: UserId,
@@ -653,7 +741,36 @@ async fn send_evidence_embed(
 	ts: Timestamp,
 	attachs: &[Attachment],
 ) {
-	let log_ch = ChannelId::new(EVIDENCE_LOG_CHANNEL_ID);
+	let client = {
+		let data = ctx.data.read().await;
+		data.get::<CdnClientKey>().cloned().expect("CdnClientKey missing")
+	};
+
+	let mut media_tasks = Vec::new();
+	for attachment in attachs {
+		if is_image_attachment(attachment) {
+			media_tasks.push(tokio::spawn(sanitize_image(
+				Arc::clone(&client),
+				attachment.id,
+				attachment.url.clone(),
+				attachment.size as usize,
+			)));
+		}
+	}
+
+	let mut sanitized = Vec::new();
+	for task in media_tasks {
+		if let Ok(Some(media)) = task.await {
+			sanitized.push(media);
+		}
+	}
+
+	let sanitized_ids: HashSet<AttachmentId> = sanitized.iter().map(|m| m.attachment_id).collect();
+
+	let log_ch = {
+		let data = ctx.data.read().await;
+		ChannelId::new(data.get::<ConfigKey>().expect("ConfigKey missing").evidence_log_channel_id)
+	};
 
 	let mut embed = CreateEmbed::new()
 		.title("\u{1F6A8} Scam Bot Detected")
@@ -668,24 +785,127 @@ async fn send_evidence_embed(
 		)
 		.field("Sent At", ts.to_string(), true);
 
-	if !attachs.is_empty() {
-		let list: Vec<String> = attachs.iter()
-			.map(|a| format!("{} ({} bytes) - {}", a.filename, a.size, a.url))
+	if !sanitized.is_empty() {
+		embed = embed.image(format!("attachment://{}", sanitized[0].file_name));
+	}
+
+	let leftovers: Vec<&Attachment> = attachs.iter().filter(|a| !sanitized_ids.contains(&a.id)).collect();
+	if !leftovers.is_empty() {
+		let list: Vec<String> = leftovers.iter()
+			.map(|a| format!("{} ({} bytes)", a.filename, a.size))
 			.collect();
-		embed = embed.field("Attachments", list.join("\n"), false);
+		embed = embed.field("Other Attachments", list.join("\n"), false);
 	}
 
 	embed = embed
 		.field("Action Taken", "All messages purged + User banned indefinitely", false)
 		.timestamp(Timestamp::now());
 
-	if let Err(e) = log_ch.send_message(http, CreateMessage::new().add_embed(embed)).await {
+	let mut message = CreateMessage::new().add_embed(embed);
+	for media in sanitized {
+		message = message.add_file(CreateAttachment::bytes(media.webp, media.file_name));
+	}
+
+	if let Err(e) = log_ch.send_message(&ctx.http, message).await {
 		eprintln!("Failed to send evidence embed: {}", e);
 	}
 }
 
-async fn send_webhook_evidence(http: &Http, msg: &Message) -> Result<Message, SerenityError> {
-	let log_ch = ChannelId::new(EVIDENCE_LOG_CHANNEL_ID);
+struct SanitizedMedia {
+	attachment_id: AttachmentId,
+	file_name: String,
+	webp: Vec<u8>,
+}
+
+async fn sanitize_image(client: Arc<reqwest::Client>, id: AttachmentId, url: String, size: usize) -> Option<SanitizedMedia> {
+	if !is_cdn_url(&url) {
+		eprintln!("Attachment {} skipped: host is not on the Discord CDN whitelist", id);
+		return None;
+	}
+
+	if size > MAX_ATTACHMENT_BYTES {
+		eprintln!("Attachment {} skipped: declared size exceeds the {} byte limit", id, MAX_ATTACHMENT_BYTES);
+		return None;
+	}
+
+	let raw = match download_capped(&client, &url).await {
+		Ok(data) => data,
+		Err(reason) => {
+			eprintln!("Attachment {} skipped: {}", id, reason);
+			return None;
+		}
+	};
+
+	let Some(format) = sniff_raster_format(&raw) else {
+		eprintln!("Attachment {} skipped: signature is not a whitelisted raster format", id);
+		return None;
+	};
+
+	let decode_task = tokio::task::spawn_blocking(move || -> Option<Vec<u8>> {
+		let mut limits = image::Limits::default();
+		limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+		limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+		limits.max_alloc = Some(MAX_DECODE_ALLOC);
+
+		let mut reader = ImageReader::with_format(Cursor::new(&raw), format);
+		reader.limits(limits);
+
+		let decoded = reader.decode().ok()?;
+		let rgba = decoded.to_rgba8();
+		let (width, height) = rgba.dimensions();
+
+		let mut webp = Vec::new();
+		let encoder = WebPEncoder::new_lossless(&mut webp);
+		encoder.encode(rgba.as_raw(), width, height, ExtendedColorType::Rgba8).ok()?;
+
+		Some(webp)
+	});
+
+	let webp = match timeout(MEDIA_PIPELINE_TIMEOUT, decode_task).await {
+		Ok(Ok(Some(data))) => data,
+		Ok(Ok(None)) => {
+			eprintln!("Attachment {} skipped: decode or encode failed under resource limits", id);
+			return None;
+		}
+		_ => {
+			eprintln!("Attachment {} skipped: pipeline panicked or timed out", id);
+			return None;
+		}
+	};
+
+	let file_name = format!("{}.webp", id.get());
+	Some(SanitizedMedia {
+		attachment_id: id,
+		file_name,
+		webp,
+	})
+}
+
+async fn download_capped(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, &'static str> {
+	let mut response = client.get(url).send().await.map_err(|_| "download request failed")?;
+
+	if let Some(length) = response.content_length() {
+		if length as usize > MAX_ATTACHMENT_BYTES {
+			return Err("declared size exceeds the byte limit");
+		}
+	}
+
+	let mut buffer = Vec::new();
+	while let Some(chunk) = response.chunk().await.map_err(|_| "download stream failed")? {
+		if buffer.len() + chunk.len() > MAX_ATTACHMENT_BYTES {
+			return Err("stream exceeded the byte limit");
+		}
+		buffer.extend_from_slice(&chunk);
+	}
+
+	Ok(buffer)
+}
+
+async fn send_webhook_evidence(ctx: &Context, msg: &Message) -> Option<Message> {
+	let log_ch = {
+		let data = ctx.data.read().await;
+		ChannelId::new(data.get::<ConfigKey>().expect("ConfigKey missing").evidence_log_channel_id)
+	};
 	let wid = msg.webhook_id.map_or("unknown".to_string(), |id| id.to_string());
 
 	let embed = CreateEmbed::new()
@@ -699,7 +919,22 @@ async fn send_webhook_evidence(http: &Http, msg: &Message) -> Result<Message, Se
 		.field("Action Taken", "Message deleted + Webhook deleted (if possible)", false)
 		.timestamp(Timestamp::now());
 
-	log_ch.send_message(http, CreateMessage::new().add_embed(embed)).await
+	match log_ch.send_message(&ctx.http, CreateMessage::new().add_embed(embed)).await {
+		Ok(message) => Some(message),
+		Err(e) => {
+			eprintln!("Failed to send webhook evidence embed: {}", e);
+			None
+		}
+	}
+}
+
+fn is_message_channel(kind: ChannelType) -> bool {
+	matches!(
+		kind,
+		ChannelType::Text
+		| ChannelType::PublicThread
+		| ChannelType::PrivateThread
+	)
 }
 
 async fn delete_all_user_messages(ctx: &Context, guild_id: GuildId, user_id: UserId) -> u64 {
@@ -711,18 +946,34 @@ async fn delete_all_user_messages(ctx: &Context, guild_id: GuildId, user_id: Use
 		}
 	};
 
-	let mut total_deleted: u64 = 0;
-
-	for (channel_id, channel) in &channels {
-		if !channel_has_messages(channel.kind) {
-			continue;
-		}
-		total_deleted += delete_user_messages_in_channel(&ctx.http, *channel_id, user_id).await;
-	}
+	let mut target_channels: Vec<ChannelId> = channels
+		.into_iter()
+		.filter(|(_, ch)| is_message_channel(ch.kind))
+		.map(|(id, _)| id)
+		.collect();
 
 	if let Ok(threads_resp) = guild_id.get_active_threads(&ctx.http).await {
-		for thread in &threads_resp.threads {
-			total_deleted += delete_user_messages_in_channel(&ctx.http, thread.id, user_id).await;
+		for thread in threads_resp.threads {
+			if is_message_channel(thread.kind) {
+				target_channels.push(thread.id);
+			}
+		}
+	}
+
+	let mut tasks = tokio::task::JoinSet::new();
+	let http = Arc::clone(&ctx.http);
+
+	for channel_id in target_channels {
+		let http_clone = Arc::clone(&http);
+		tasks.spawn(async move {
+			delete_user_messages_in_channel(&http_clone, channel_id, user_id).await
+		});
+	}
+
+	let mut total_deleted: u64 = 0;
+	while let Some(res) = tasks.join_next().await {
+		if let Ok(count) = res {
+			total_deleted += count;
 		}
 	}
 
@@ -774,8 +1025,6 @@ async fn delete_user_messages_in_channel(http: &Http, channel_id: ChannelId, use
 		if oldest_ts < fourteen_days_ago && recent_ids.is_empty() && old_ids.is_empty() {
 			break;
 		}
-
-		sleep(Duration::from_millis(FETCH_DELAY_MS)).await;
 	}
 
 	while recent_ids.len() >= 2 {
@@ -793,12 +1042,9 @@ async fn delete_user_messages_in_channel(http: &Http, channel_id: ChannelId, use
 					if channel_id.delete_message(http, *id).await.is_ok() {
 						deleted += 1;
 					}
-					sleep(Duration::from_millis(DELETE_DELAY_MS)).await;
 				}
 			}
 		}
-
-		sleep(Duration::from_millis(BULK_DELETE_DELAY_MS)).await;
 	}
 
 	for id in recent_ids.into_iter().chain(old_ids) {
@@ -811,7 +1057,6 @@ async fn delete_user_messages_in_channel(http: &Http, channel_id: ChannelId, use
 				}
 			}
 		}
-		sleep(Duration::from_millis(DELETE_DELAY_MS)).await;
 	}
 
 	deleted
@@ -831,12 +1076,591 @@ async fn rename_trap_channel(ctx: &Context) {
 		}
 	};
 
-	let channel_id = ChannelId::new(TRAP_CHANNEL_ID);
+	let channel_id = {
+		let data = ctx.data.read().await;
+		ChannelId::new(data.get::<ConfigKey>().expect("ConfigKey missing").trap_channel_id)
+	};
 
 	match channel_id.edit(&ctx.http, EditChannel::new().name(&new_name)).await {
 		Ok(_) => println!("Renamed trap channel to \"{}\"", new_name),
 		Err(e) => eprintln!("Failed to rename trap channel: {}", e),
 	}
+}
+
+fn say_unauthorized_response() -> CreateInteractionResponse {
+	CreateInteractionResponse::Message(
+		CreateInteractionResponseMessage::new()
+			.content("You are not authorized to use this command.")
+			.ephemeral(true),
+	)
+}
+
+async fn say_user_authorized(ctx: &Context, user_id: UserId) -> bool {
+	let data = ctx.data.read().await;
+	data.get::<ConfigKey>()
+		.expect("ConfigKey missing")
+		.owner_ids
+		.contains(&user_id.get())
+}
+
+fn say_notice(text: &'static str) -> CreateInteractionResponseMessage {
+	CreateInteractionResponseMessage::new().content(text)
+}
+
+fn say_builder_components() -> Vec<CreateActionRow> {
+	vec![
+		CreateActionRow::Buttons(vec![
+			CreateButton::new(SAY_ADD_FIELD_BUTTON)
+				.label("Add field")
+				.style(ButtonStyle::Primary),
+			CreateButton::new(SAY_AUTHOR_BUTTON)
+				.label("Author")
+				.style(ButtonStyle::Secondary),
+			CreateButton::new(SAY_FOOTER_BUTTON)
+				.label("Footer")
+				.style(ButtonStyle::Secondary),
+			CreateButton::new(SAY_EDIT_MAIN_BUTTON)
+				.label("Edit main")
+				.style(ButtonStyle::Secondary),
+		]),
+		CreateActionRow::Buttons(vec![
+			CreateButton::new(SAY_SEND_BUTTON)
+				.label("Send")
+				.style(ButtonStyle::Success),
+			CreateButton::new(SAY_CANCEL_BUTTON)
+				.label("Cancel")
+				.style(ButtonStyle::Danger),
+		]),
+	]
+}
+
+fn builder_response_msg(draft: &SayDraft, notice: Option<&'static str>) -> CreateInteractionResponseMessage {
+	let mut message = CreateInteractionResponseMessage::new().add_embed(draft.embed());
+
+	if let Some(text) = notice {
+		message = message.content(text);
+	}
+
+	message.components(say_builder_components())
+}
+
+fn with_value(input: CreateInputText, value: &str) -> CreateInputText {
+	if value.is_empty() {
+		input
+	} else {
+		input.value(value)
+	}
+}
+
+fn simple_message_modal(channel_id: ChannelId) -> CreateModal {
+	let input = CreateInputText::new(InputTextStyle::Paragraph, "Message content", SAY_CONTENT_INPUT)
+		.required(true)
+		.max_length(CONTENT_LIMIT as u16);
+
+	CreateModal::new(format!("{SAY_SIMPLE_PREFIX}{}", channel_id.get()), "Send simple message")
+		.components(vec![CreateActionRow::InputText(input)])
+}
+
+fn embed_main_modal(custom_id: String, draft: Option<&SayDraft>) -> CreateModal {
+	let (title, description, color, image, thumbnail) = match draft {
+		Some(d) => (
+			d.title.as_str(),
+			d.description.as_str(),
+			d.color.map(|c| format!("#{c:06X}")),
+			d.image_url.as_str(),
+			d.thumbnail_url.as_str(),
+		),
+		None => ("", "", None, "", ""),
+	};
+
+	let title_input = with_value(
+		CreateInputText::new(InputTextStyle::Short, "Title", SAY_TITLE_INPUT)
+			.required(false)
+			.max_length(EMBED_TITLE_LIMIT as u16),
+		title,
+	);
+	let description_input = with_value(
+		CreateInputText::new(InputTextStyle::Paragraph, "Description", SAY_DESCRIPTION_INPUT)
+			.required(false)
+			.max_length(MODAL_INPUT_LIMIT),
+		description,
+	);
+	let color_input = with_value(
+		CreateInputText::new(InputTextStyle::Short, "Color (hex)", SAY_COLOR_INPUT)
+			.required(false)
+			.max_length(7)
+			.placeholder("#5865F2"),
+		color.as_deref().unwrap_or(""),
+	);
+	let image_input = with_value(
+		CreateInputText::new(InputTextStyle::Short, "Image URL", SAY_IMAGE_INPUT)
+			.required(false)
+			.max_length(URL_INPUT_LIMIT),
+		image,
+	);
+	let thumbnail_input = with_value(
+		CreateInputText::new(InputTextStyle::Short, "Thumbnail URL", SAY_THUMBNAIL_INPUT)
+			.required(false)
+			.max_length(URL_INPUT_LIMIT),
+		thumbnail,
+	);
+
+	CreateModal::new(custom_id, "Build embed").components(vec![
+		CreateActionRow::InputText(title_input),
+		CreateActionRow::InputText(description_input),
+		CreateActionRow::InputText(color_input),
+		CreateActionRow::InputText(image_input),
+		CreateActionRow::InputText(thumbnail_input),
+	])
+}
+
+fn field_modal() -> CreateModal {
+	let name = CreateInputText::new(InputTextStyle::Short, "Field name", SAY_FIELD_NAME_INPUT)
+		.required(true)
+		.max_length(EMBED_FIELD_NAME_LIMIT as u16);
+	let value = CreateInputText::new(InputTextStyle::Paragraph, "Field value", SAY_FIELD_VALUE_INPUT)
+		.required(true)
+		.max_length(EMBED_FIELD_VALUE_LIMIT as u16);
+	let inline = CreateInputText::new(InputTextStyle::Short, "Inline (yes/no)", SAY_FIELD_INLINE_INPUT)
+		.required(false)
+		.max_length(5)
+		.placeholder("no");
+
+	CreateModal::new(SAY_FIELD_MODAL, "Add embed field").components(vec![
+		CreateActionRow::InputText(name),
+		CreateActionRow::InputText(value),
+		CreateActionRow::InputText(inline),
+	])
+}
+
+fn author_modal(draft: Option<&SayDraft>) -> CreateModal {
+	let (name, url, icon) = match draft {
+		Some(d) => (d.author_name.as_str(), d.author_url.as_str(), d.author_icon_url.as_str()),
+		None => ("", "", ""),
+	};
+
+	let name_input = with_value(
+		CreateInputText::new(InputTextStyle::Short, "Author name", SAY_AUTHOR_NAME_INPUT)
+			.required(true)
+			.max_length(EMBED_AUTHOR_LIMIT as u16),
+		name,
+	);
+	let url_input = with_value(
+		CreateInputText::new(InputTextStyle::Short, "Author URL", SAY_AUTHOR_URL_INPUT)
+			.required(false)
+			.max_length(URL_INPUT_LIMIT),
+		url,
+	);
+	let icon_input = with_value(
+		CreateInputText::new(InputTextStyle::Short, "Author icon URL", SAY_AUTHOR_ICON_INPUT)
+			.required(false)
+			.max_length(URL_INPUT_LIMIT),
+		icon,
+	);
+
+	CreateModal::new(SAY_AUTHOR_MODAL, "Set embed author").components(vec![
+		CreateActionRow::InputText(name_input),
+		CreateActionRow::InputText(url_input),
+		CreateActionRow::InputText(icon_input),
+	])
+}
+
+fn footer_modal(draft: Option<&SayDraft>) -> CreateModal {
+	let (text, icon) = match draft {
+		Some(d) => (d.footer_text.as_str(), d.footer_icon_url.as_str()),
+		None => ("", ""),
+	};
+
+	let text_input = with_value(
+		CreateInputText::new(InputTextStyle::Short, "Footer text", SAY_FOOTER_TEXT_INPUT)
+			.required(true)
+			.max_length(EMBED_FOOTER_LIMIT as u16),
+		text,
+	);
+	let icon_input = with_value(
+		CreateInputText::new(InputTextStyle::Short, "Footer icon URL", SAY_FOOTER_ICON_INPUT)
+			.required(false)
+			.max_length(URL_INPUT_LIMIT),
+		icon,
+	);
+
+	CreateModal::new(SAY_FOOTER_MODAL, "Set embed footer").components(vec![
+		CreateActionRow::InputText(text_input),
+		CreateActionRow::InputText(icon_input),
+	])
+}
+
+fn apply_main_inputs(modal: &ModalInteraction, draft: &mut SayDraft) -> Option<&'static str> {
+	let mut notice: Option<&'static str> = None;
+
+	draft.title = modal_value(modal, SAY_TITLE_INPUT).unwrap_or("").to_string();
+	draft.description = modal_value(modal, SAY_DESCRIPTION_INPUT).unwrap_or("").to_string();
+
+	draft.color = match modal_value(modal, SAY_COLOR_INPUT) {
+		Some(raw) if !raw.is_empty() => match parse_hex_color(raw) {
+			Some(color) => Some(color),
+			None => {
+				notice = Some("Color ignored: expected a hex value like 5865F2.");
+				None
+			}
+		},
+		_ => None,
+	};
+
+	draft.image_url = modal_value(modal, SAY_IMAGE_INPUT).unwrap_or("").to_string();
+	if !draft.image_url.is_empty() && !is_http_url(&draft.image_url) {
+		notice = Some("Image ignored: the URL must start with https:// or http://.");
+		draft.image_url.clear();
+	}
+
+	draft.thumbnail_url = modal_value(modal, SAY_THUMBNAIL_INPUT).unwrap_or("").to_string();
+	if !draft.thumbnail_url.is_empty() && !is_http_url(&draft.thumbnail_url) {
+		notice = Some("Thumbnail ignored: the URL must start with https:// or http://.");
+		draft.thumbnail_url.clear();
+	}
+
+	notice
+}
+
+async fn handle_say_command(ctx: &Context, command: CommandInteraction) {
+	if !say_user_authorized(ctx, command.user.id).await {
+		let _ = command.create_response(&ctx.http, say_unauthorized_response()).await;
+		return;
+	}
+
+	let options = vec![
+		CreateSelectMenuOption::new("Simple message", "message")
+			.description("Plain text message (2000 character limit)"),
+		CreateSelectMenuOption::new("Embed", "embed")
+			.description("Customizable embed (title, description, color, images, fields...)"),
+	];
+	let select = CreateSelectMenu::new(SAY_MODE_SELECT_ID, CreateSelectMenuKind::String { options });
+	let response = CreateInteractionResponseMessage::new()
+		.content("What do you want to send?")
+		.ephemeral(true)
+		.components(vec![CreateActionRow::SelectMenu(select)]);
+
+	let _ = command.create_response(&ctx.http, CreateInteractionResponse::Message(response)).await;
+}
+
+async fn handle_say_component(ctx: &Context, component: ComponentInteraction) {
+	if !say_user_authorized(ctx, component.user.id).await {
+		let _ = component.create_response(&ctx.http, say_unauthorized_response()).await;
+		return;
+	}
+
+	match component.data.custom_id.as_str() {
+		SAY_MODE_SELECT_ID => {
+			let ComponentInteractionDataKind::StringSelect { values } = &component.data.kind else {
+				return;
+			};
+			let response = match values.first().map(String::as_str) {
+				Some("message") => {
+					CreateInteractionResponse::Modal(simple_message_modal(component.channel_id))
+				}
+				Some("embed") => CreateInteractionResponse::Modal(embed_main_modal(
+					format!("{SAY_EMBED_PREFIX}{}", component.channel_id.get()),
+					None,
+				)),
+				_ => return,
+			};
+			let _ = component.create_response(&ctx.http, response).await;
+		}
+		SAY_ADD_FIELD_BUTTON => {
+			let at_cap = {
+				let data = ctx.data.read().await;
+				let builder = data.get::<SayBuilderKey>().expect("SayBuilderKey missing");
+				let drafts = builder.drafts.lock().unwrap();
+				drafts
+					.get(&component.user.id.get())
+					.is_some_and(|draft| draft.fields.len() >= EMBED_FIELD_COUNT_LIMIT)
+			};
+
+			let response = if at_cap {
+				CreateInteractionResponse::UpdateMessage(say_notice(
+					"This embed already has the maximum of 25 fields.",
+				))
+			} else {
+				CreateInteractionResponse::Modal(field_modal())
+			};
+			let _ = component.create_response(&ctx.http, response).await;
+		}
+		SAY_AUTHOR_BUTTON | SAY_FOOTER_BUTTON | SAY_EDIT_MAIN_BUTTON => {
+			let response = {
+				let data = ctx.data.read().await;
+				let builder = data.get::<SayBuilderKey>().expect("SayBuilderKey missing");
+				let drafts = builder.drafts.lock().unwrap();
+
+				match drafts.get(&component.user.id.get()) {
+					Some(draft) => {
+						let modal = if component.data.custom_id == SAY_AUTHOR_BUTTON {
+							author_modal(Some(draft))
+						} else if component.data.custom_id == SAY_FOOTER_BUTTON {
+							footer_modal(Some(draft))
+						} else {
+							embed_main_modal(
+								format!("{SAY_EDIT_MAIN_PREFIX}{}", draft.channel_id.get()),
+								Some(draft),
+							)
+						};
+						CreateInteractionResponse::Modal(modal)
+					}
+					None => CreateInteractionResponse::UpdateMessage(say_notice(
+						"This builder session has expired. Run /say again.",
+					)),
+				}
+			};
+			let _ = component.create_response(&ctx.http, response).await;
+		}
+		SAY_SEND_BUTTON => {
+			let (response, draft) = {
+				let data = ctx.data.read().await;
+				let builder = data.get::<SayBuilderKey>().expect("SayBuilderKey missing");
+				let mut drafts = builder.drafts.lock().unwrap();
+
+				match drafts.remove(&component.user.id.get()) {
+					None => (
+						say_notice("This builder session has expired. Run /say again."),
+						None,
+					),
+					Some(draft) => {
+						let problem = if draft.is_empty() {
+							Some("There is nothing to send yet. Fill in at least one option or add a field.")
+						} else if draft.total_len() > EMBED_TOTAL_LIMIT {
+							Some("This embed exceeds the 6000 character total limit. Remove something.")
+						} else {
+							None
+						};
+
+						match problem {
+							Some(problem) => {
+								let response = builder_response_msg(&draft, Some(problem));
+								drafts.insert(component.user.id.get(), draft);
+								(response, None)
+							}
+							None => (say_notice("Sending..."), Some(draft)),
+						}
+					}
+				}
+			};
+
+			let _ = component
+				.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(response))
+				.await;
+
+			if let Some(draft) = draft {
+				match draft
+					.channel_id
+					.send_message(&ctx.http, CreateMessage::new().add_embed(draft.embed()))
+					.await
+				{
+					Ok(_) => {
+						let _ = component
+							.edit_response(
+								&ctx.http,
+								EditInteractionResponse::new().content("Sent."),
+							)
+							.await;
+					}
+					Err(e) => {
+						eprintln!("Failed to send /say embed: {}", e);
+						let _ = component
+							.edit_response(
+								&ctx.http,
+								EditInteractionResponse::new().content(
+									"Failed to send the message. I might be missing permissions in the target channel.",
+								),
+							)
+							.await;
+					}
+				}
+			}
+		}
+		SAY_CANCEL_BUTTON => {
+			let response = {
+				let data = ctx.data.read().await;
+				let builder = data.get::<SayBuilderKey>().expect("SayBuilderKey missing");
+				let mut drafts = builder.drafts.lock().unwrap();
+
+				if drafts.remove(&component.user.id.get()).is_some() {
+					say_notice("Cancelled.")
+				} else {
+					say_notice("This builder session has expired. Run /say again.")
+				}
+			};
+			let _ = component
+				.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(response))
+				.await;
+		}
+		_ => {}
+	}
+}
+
+async fn handle_say_modal(ctx: &Context, modal: ModalInteraction) {
+	if !say_user_authorized(ctx, modal.user.id).await {
+		let _ = modal.create_response(&ctx.http, say_unauthorized_response()).await;
+		return;
+	}
+
+	let uid = modal.user.id.get();
+
+	if modal.data.custom_id.starts_with(SAY_SIMPLE_PREFIX) {
+		let Some(text) = modal_value(&modal, SAY_CONTENT_INPUT) else {
+			return;
+		};
+
+		if text.is_empty() || text.chars().count() > CONTENT_LIMIT {
+			let _ = modal
+				.create_response(
+					&ctx.http,
+					CreateInteractionResponse::UpdateMessage(say_notice(
+						"The message must be between 1 and 2000 characters.",
+					)),
+				)
+				.await;
+			return;
+		}
+
+		let channel_num = modal
+			.data
+			.custom_id
+			.strip_prefix(SAY_SIMPLE_PREFIX)
+			.and_then(|raw| raw.parse::<u64>().ok())
+			.unwrap_or(0);
+
+		let _ = modal
+			.create_response(
+				&ctx.http,
+				CreateInteractionResponse::UpdateMessage(say_notice("Sending...")),
+			)
+			.await;
+
+		match ChannelId::new(channel_num)
+			.send_message(&ctx.http, CreateMessage::new().content(text))
+			.await
+		{
+			Ok(_) => {
+				let _ = modal
+					.edit_response(&ctx.http, EditInteractionResponse::new().content("Sent."))
+					.await;
+			}
+			Err(e) => {
+				eprintln!("Failed to send /say message: {}", e);
+				let _ = modal
+					.edit_response(
+						&ctx.http,
+						EditInteractionResponse::new().content(
+							"Failed to send the message. I might be missing permissions in the target channel.",
+						),
+					)
+					.await;
+			}
+		}
+		return;
+	}
+
+	if modal.data.custom_id.starts_with(SAY_EMBED_PREFIX) || modal.data.custom_id.starts_with(SAY_EDIT_MAIN_PREFIX) {
+		let response = {
+			let data = ctx.data.read().await;
+			let builder = data.get::<SayBuilderKey>().expect("SayBuilderKey missing");
+			let mut drafts = builder.drafts.lock().unwrap();
+
+			if modal.data.custom_id.starts_with(SAY_EMBED_PREFIX) {
+				let channel_num = modal
+					.data
+					.custom_id
+					.strip_prefix(SAY_EMBED_PREFIX)
+					.and_then(|raw| raw.parse::<u64>().ok())
+					.unwrap_or(0);
+				drafts.insert(uid, SayDraft::new(ChannelId::new(channel_num)));
+			}
+
+			match drafts.get_mut(&uid) {
+				None => say_notice("This builder session has expired. Run /say again."),
+				Some(draft) => {
+					let notice = apply_main_inputs(&modal, draft);
+					let notice = notice.or_else(|| {
+						if draft.is_empty() {
+							Some("Fill in at least one option, or add fields, an author, or a footer.")
+						} else {
+							None
+						}
+					});
+					builder_response_msg(draft, notice)
+				}
+			}
+		};
+
+		let _ = modal
+			.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(response))
+			.await;
+		return;
+	}
+
+	let response = {
+		let data = ctx.data.read().await;
+		let builder = data.get::<SayBuilderKey>().expect("SayBuilderKey missing");
+		let mut drafts = builder.drafts.lock().unwrap();
+
+		match drafts.get_mut(&uid) {
+			None => say_notice("This builder session has expired. Run /say again."),
+			Some(draft) => match modal.data.custom_id.as_str() {
+				SAY_FIELD_MODAL => {
+					if draft.fields.len() >= EMBED_FIELD_COUNT_LIMIT {
+						builder_response_msg(draft, Some("This embed already has the maximum of 25 fields."))
+					} else {
+						let name = modal_value(&modal, SAY_FIELD_NAME_INPUT).unwrap_or("");
+						let value = modal_value(&modal, SAY_FIELD_VALUE_INPUT).unwrap_or("");
+						let inline = modal_value(&modal, SAY_FIELD_INLINE_INPUT)
+							.is_some_and(parse_inline_flag);
+						draft.fields.push((name.to_string(), value.to_string(), inline));
+						builder_response_msg(draft, Some("Field added."))
+					}
+				}
+				SAY_AUTHOR_MODAL => {
+					draft.author_name =
+						modal_value(&modal, SAY_AUTHOR_NAME_INPUT).unwrap_or("").to_string();
+					draft.author_url =
+						modal_value(&modal, SAY_AUTHOR_URL_INPUT).unwrap_or("").to_string();
+					draft.author_icon_url =
+						modal_value(&modal, SAY_AUTHOR_ICON_INPUT).unwrap_or("").to_string();
+
+					let mut notice: Option<&'static str> = None;
+					if !draft.author_url.is_empty() && !is_http_url(&draft.author_url) {
+						notice = Some("Author URL ignored: it must start with https:// or http://.");
+						draft.author_url.clear();
+					}
+					if !draft.author_icon_url.is_empty() && !is_http_url(&draft.author_icon_url) {
+						notice =
+							Some("Author icon ignored: it must start with https:// or http://.");
+						draft.author_icon_url.clear();
+					}
+
+					builder_response_msg(draft, notice)
+				}
+				SAY_FOOTER_MODAL => {
+					draft.footer_text =
+						modal_value(&modal, SAY_FOOTER_TEXT_INPUT).unwrap_or("").to_string();
+					draft.footer_icon_url =
+						modal_value(&modal, SAY_FOOTER_ICON_INPUT).unwrap_or("").to_string();
+
+					let mut notice: Option<&'static str> = None;
+					if !draft.footer_icon_url.is_empty() && !is_http_url(&draft.footer_icon_url) {
+						notice =
+							Some("Footer icon ignored: it must start with https:// or http://.");
+						draft.footer_icon_url.clear();
+					}
+
+					builder_response_msg(draft, notice)
+				}
+				_ => say_notice("Unknown builder form."),
+			},
+		}
+	};
+
+	let _ = modal
+		.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(response))
+		.await;
 }
 
 struct Handler;
@@ -852,9 +1676,12 @@ fn rng_range<T, R>(range: R) -> T where T: SampleUniform, R: SampleRange<T> {
 #[async_trait]
 impl EventHandler for Handler {
 	async fn message(&self, ctx: Context, msg: Message) {
-		let target_guild_id = 1248085334861025350; // hachimi project official server
+		let config = {
+			let data = ctx.data.read().await;
+			data.get::<ConfigKey>().cloned().expect("ConfigKey missing")
+		};
 
-		if msg.author.bot || msg.guild_id.is_none_or(|id| id.get() != target_guild_id) {
+		if msg.author.bot || msg.guild_id.is_none_or(|id| id.get() != config.target_guild_id) {
 			return;
 		}
 
@@ -863,7 +1690,7 @@ impl EventHandler for Handler {
 		let sticky = data.get::<StickyKey>().cloned().expect("StickyState missing");
 		drop(data);
 
-		if msg.channel_id.get() == TRAP_CHANNEL_ID {
+		if msg.channel_id.get() == config.trap_channel_id {
 			let ctx_clone = ctx.clone();
 			let msg_clone = msg.clone();
 			tokio::spawn(async move {
@@ -883,19 +1710,15 @@ impl EventHandler for Handler {
 			if let Err(e) = msg.delete(&ctx.http).await {
 				eprintln!("Failed to delete phishing message: {}", e);
 			} else {
-				let emojis = [
-					"<:unai2:1463880445669281876>",
-					"<:unai3:1463880567400566825>"
-				];
-				let index: usize = rng_range(0..emojis.len());
-				let emoji = emojis[index];
+				let index: usize = rng_range(0..config.phishing_emojis.len());
+				let emoji = &config.phishing_emojis[index];
 				let response = format!("{} bad link! {}", msg.author.mention(), emoji);
 				let _ = msg.channel_id.say(&ctx.http, response).await;
 			}
 			return;
 		}
 
-		if msg.channel_id.get() == HELP_CHANNEL_ID {
+		if msg.channel_id.get() == config.help_channel_id {
 			let mut should_delete_id = None;
 			{
 				let mut last_author = sticky.last_author_id.lock().unwrap();
@@ -917,24 +1740,17 @@ impl EventHandler for Handler {
 
 		// let content_lower = msg.content.to_lowercase();
 		// 0.01% on help channel, 0.1% on all channels
-		let rate = if msg.channel_id.get() == HELP_CHANNEL_ID { 0.0001 } else { 0.001 };
+		let rate = if msg.channel_id.get() == config.help_channel_id { 0.0001 } else { 0.001 };
 		if should_show(rate) {
-			let silly_emojis = [
-				"<a:sildance:1462056515056828499>",
-				"<:sillier:1463878217197682865>",
-				"<a:Sillymambo:1463878469610897485>",
-				"<:stillinstare:1463878652402860228>"
-			];
-
-			let index: usize = rng_range(0..silly_emojis.len());
-			let emoji = silly_emojis[index];
+			let index: usize = rng_range(0..config.silly_emojis.len());
+			let emoji = &config.silly_emojis[index];
 			let _ = msg.reply(&ctx.http, emoji).await;
-			if let Ok(reaction) = ReactionType::try_from(emoji) {
+			if let Ok(reaction) = ReactionType::try_from(emoji.as_str()) {
 				let _ = msg.react(&ctx.http, reaction).await;
 			}
 		}
 
-		if msg.channel_id.get() == SILLY_CHANNEL {
+		if msg.channel_id.get() == config.silly_channel_id {
 			let data = ctx.data.read().await;
 			let queue_state = data.get::<SillyReplyQueueKey>().cloned().expect("SillyReplyQueue missing");
 			drop(data);
@@ -965,7 +1781,7 @@ impl EventHandler for Handler {
 			}
 		}
 
-		if is_special_day() && !GACHA_IGNORE_USER_LIST.contains(&msg.author.id.get()) {
+		if is_special_day() && msg.author.id.get() != config.gacha_ignore_user_id {
 			if let Some((tier_name, outcome)) = perform_gacha_pull(msg.author.id.get(), msg.id.get(), &msg.content, &ROLE_GACHA_POOL) {
 				let role_id_raw = outcome.role_id;
 				let role_id = RoleId::new(role_id_raw);
@@ -1049,6 +1865,27 @@ impl EventHandler for Handler {
 		tokio::spawn(async move {
 			start_story_worker(ctx_clone2, story_queue).await;
 		});
+
+		let say_command = CreateCommand::new(SAY_COMMAND_NAME)
+			.description("Make the bot say something (owners only)")
+			.kind(CommandType::ChatInput);
+
+		for guild in &ready.guilds {
+			let _ = guild.id.set_commands(&ctx.http, vec![say_command.clone()]).await;
+		}
+	}
+
+	async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+		match interaction {
+			Interaction::Command(command) => {
+				if command.data.name == SAY_COMMAND_NAME {
+					handle_say_command(&ctx, command).await;
+				}
+			}
+			Interaction::Component(component) => handle_say_component(&ctx, component).await,
+			Interaction::Modal(modal) => handle_say_modal(&ctx, modal).await,
+			_ => {}
+		}
 	}
 }
 
@@ -1087,6 +1924,20 @@ async fn start_daily_download(url: String, filename: String, protect: Arc<Phishi
 async fn main() {
 	dotenvy::dotenv().ok();
 
+	let config = Arc::new(BotConfig {
+		target_guild_id: parse_env("GUILD_ID"),
+		trap_channel_id: parse_env("TRAP_CHANNEL_ID"),
+		evidence_log_channel_id: parse_env("EVIDENCE_LOG_CHANNEL_ID"),
+		silly_channel_id: parse_env("SILLY_CHANNEL_ID"),
+		help_channel_id: parse_env("HELP_CHANNEL_ID"),
+		gacha_ignore_user_id: parse_env("GACHA_IGNORE_USER_ID"),
+		appeal_url: parse_env("APPEAL_URL"),
+		sticky_enabled: parse_env("STICKY_ENABLED"),
+		owner_ids: parse_env_list::<u64>("OWNER_IDS").into_iter().collect(),
+		phishing_emojis: parse_env_list("PHISHING_EMOJIS"),
+		silly_emojis: parse_env_list("SILLY_EMOJIS")
+	});
+
 	let protect = Arc::new(PhishingProtect {
 		set: RwLock::new(HashSet::new())
 	});
@@ -1102,7 +1953,7 @@ async fn main() {
 	});
 
 	let sticky_state = Arc::new(StickyState {
-		enabled: false,
+		enabled: config.sticky_enabled,
 		last_sticky_id: Mutex::new(None),
 		last_author_id: Mutex::new(None)
 	});
@@ -1112,13 +1963,21 @@ async fn main() {
 	});
 	safe_words.load("safe_english_words.txt");
 
-	let owners = Arc::new(OwnersList {
-		ids: RwLock::new(HashSet::new())
-	});
-	owners.load("owners.txt");
-
 	let ban_tracker = Arc::new(BanTracker {
 		pending: Mutex::new(HashSet::new())
+	});
+
+	let cdn_client = Arc::new(
+		reqwest::Client::builder()
+			.redirect(reqwest::redirect::Policy::none())
+			.connect_timeout(Duration::from_secs(10))
+			.timeout(Duration::from_secs(20))
+			.build()
+			.expect("Failed to build the CDN HTTP client")
+	);
+
+	let say_builder = Arc::new(SayBuilder {
+		drafts: Mutex::new(HashMap::new())
 	});
 
 	let protect_clone = Arc::clone(&protect);
@@ -1131,7 +1990,7 @@ async fn main() {
 		).await;
 	});
 
-	let token = std::env::var("TOKEN").expect("Expected a token in the environment");
+	let token = std::env::var("TOKEN").expect("Missing TOKEN environment variable.");
 	let intents = GatewayIntents::GUILD_MESSAGES
 		| GatewayIntents::MESSAGE_CONTENT
 		| GatewayIntents::GUILD_MEMBERS;
@@ -1143,13 +2002,15 @@ async fn main() {
 
 	{
 		let mut data = client.data.write().await;
+		data.insert::<ConfigKey>(Arc::clone(&config));
 		data.insert::<PhishingKey>(protect);
 		data.insert::<StickyKey>(sticky_state);
 		data.insert::<StoryLinesKey>(story_lines);
 		data.insert::<SillyReplyQueueKey>(story_queue);
 		data.insert::<SafeWordsKey>(safe_words);
-		data.insert::<OwnersKey>(owners);
 		data.insert::<BanTrackerKey>(ban_tracker);
+		data.insert::<CdnClientKey>(cdn_client);
+		data.insert::<SayBuilderKey>(say_builder);
 	}
 
 	if let Err(why) = client.start().await {
