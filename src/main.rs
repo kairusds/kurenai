@@ -71,6 +71,8 @@ pub struct BotConfig {
 	pub evidence_log_channel_id: u64,
 	pub silly_channel_id: u64,
 	pub help_channel_id: u64,
+	pub announce_channel_id: u64,
+	pub server_ping_role_id: u64,
 	pub gacha_ignore_user_id: u64,
 	pub appeal_url: String,
 	pub sticky_enabled: bool,
@@ -163,54 +165,18 @@ pub fn perform_gacha_pull<T: Clone + 'static>(
 }
 
 fn is_special_day() -> bool {
+	special_day_announcement().is_some()
+}
+
+fn special_day_announcement() -> Option<((u32, u32), SpecialDay)> {
 	let now = Utc::now().with_timezone(&Tokyo);
 
-	// mm/dd
-	let special_days = [
-		(1, 1), // new year
-		(2, 14), // valentine's
-		(2, 24), // uma jp anniversary
-		(3, 14), // white day (jp holiday)
-		(3, 29), // hachimi's first release (https://github.com/Hachimi-Hachimi/Hachimi/releases/tag/v0.1.0)
-		(4, 1), // april fools
-		(4, 5), // easter
-		// golden week //
-		(4, 29),
-		(4, 30),
-		(5, 1),
-		(5, 2),
-		(5, 3),
-		(5, 4),
-		(5, 5),
-		(5, 6),
-		//////////////////
-		// june bride //
-		(6, 7),
-		(6, 8),
-		(6, 9),
-		(6, 10),
-		(6, 11),
-		(6, 12),
-		(6, 13),
-		///////////////
-		(7, 7), // tanabata
-		(7, 20), // marine day
-		// obon //
-		(8, 13),
-		(8, 14),
-		(8, 15),
-		(8, 16),
-		////////
-		(8, 24), // uma jp half anniversary
-		(8, 25), // otsukimi
-		(10, 12), // sports day
-		(10, 31), // halloween
-		(11, 23), // labor thanksgiving day
-		(12, 24), // christmas eve
-		(12, 25), // christmas
-	];
-
-	special_days.contains(&(now.month(), now.day()))
+	SpecialDay::ALL.iter().find_map(|day| {
+		day.dates()
+			.iter()
+			.find(|(month, date)| (*month, *date) == (now.month(), now.day()))
+			.map(|hit| (*hit, *day))
+	})
 }
 
 pub struct StoryLines {
@@ -314,6 +280,15 @@ struct StickyState {
 struct StickyKey;
 impl TypeMapKey for StickyKey {
 	type Value = Arc<StickyState>;
+}
+
+struct AnnounceState {
+	last_announced: Mutex<Option<(u32, u32)>>
+}
+
+struct AnnounceKey;
+impl TypeMapKey for AnnounceKey {
+	type Value = Arc<AnnounceState>;
 }
 
 async fn start_story_worker(ctx: Context, state: Arc<SillyReplyQueue>) {
@@ -1087,6 +1062,21 @@ async fn rename_trap_channel(ctx: &Context) {
 	}
 }
 
+async fn send_special_day_announcement(ctx: &Context, occasion: SpecialDay) {
+	let config = {
+		let data = ctx.data.read().await;
+		data.get::<ConfigKey>().cloned().expect("ConfigKey missing")
+	};
+
+	let channel_id = ChannelId::new(config.announce_channel_id);
+	let content = format!("<@&{}>\n{}", config.server_ping_role_id, occasion.line());
+
+	match channel_id.say(&ctx.http, content).await {
+		Ok(_) => println!("Announced {} in channel {}", occasion.occasion(), channel_id),
+		Err(e) => eprintln!("Failed to announce {}: {}", occasion.occasion(), e),
+	}
+}
+
 fn say_unauthorized_response() -> CreateInteractionResponse {
 	CreateInteractionResponse::Message(
 		CreateInteractionResponseMessage::new()
@@ -1781,6 +1771,27 @@ impl EventHandler for Handler {
 			}
 		}
 
+		if let Some((today, occasion)) = special_day_announcement() {
+			let already_announced = {
+				let state = {
+					let data = ctx.data.read().await;
+					data.get::<AnnounceKey>().cloned().expect("AnnounceState missing")
+				};
+				let mut last = state.last_announced.lock().unwrap();
+
+				if *last == Some(today) {
+					true
+				} else {
+					*last = Some(today);
+					false
+				}
+			};
+
+			if !already_announced {
+				send_special_day_announcement(&ctx, occasion).await;
+			}
+		}
+
 		if is_special_day() && msg.author.id.get() != config.gacha_ignore_user_id {
 			if let Some((tier_name, outcome)) = perform_gacha_pull(msg.author.id.get(), msg.id.get(), &msg.content, &ROLE_GACHA_POOL) {
 				let role_id_raw = outcome.role_id;
@@ -1930,6 +1941,8 @@ async fn main() {
 		evidence_log_channel_id: parse_env("EVIDENCE_LOG_CHANNEL_ID"),
 		silly_channel_id: parse_env("SILLY_CHANNEL_ID"),
 		help_channel_id: parse_env("HELP_CHANNEL_ID"),
+		announce_channel_id: parse_env("ANNOUNCE_CHANNEL_ID"),
+		server_ping_role_id: parse_env("SERVER_PING_ROLE_ID"),
 		gacha_ignore_user_id: parse_env("GACHA_IGNORE_USER_ID"),
 		appeal_url: parse_env("APPEAL_URL"),
 		sticky_enabled: parse_env("STICKY_ENABLED"),
@@ -1965,6 +1978,10 @@ async fn main() {
 
 	let ban_tracker = Arc::new(BanTracker {
 		pending: Mutex::new(HashSet::new())
+	});
+
+	let announce_state = Arc::new(AnnounceState {
+		last_announced: Mutex::new(None)
 	});
 
 	let cdn_client = Arc::new(
@@ -2005,6 +2022,7 @@ async fn main() {
 		data.insert::<ConfigKey>(Arc::clone(&config));
 		data.insert::<PhishingKey>(protect);
 		data.insert::<StickyKey>(sticky_state);
+		data.insert::<AnnounceKey>(announce_state);
 		data.insert::<StoryLinesKey>(story_lines);
 		data.insert::<SillyReplyQueueKey>(story_queue);
 		data.insert::<SafeWordsKey>(safe_words);
