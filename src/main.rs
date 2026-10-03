@@ -72,6 +72,7 @@ pub struct BotConfig {
 	pub silly_channel_id: u64,
 	pub help_channel_id: u64,
 	pub announce_channel_id: u64,
+	pub supporter_role_id: u64,
 	pub server_ping_role_id: u64,
 	pub gacha_ignore_user_id: u64,
 	pub appeal_url: String,
@@ -1077,6 +1078,55 @@ async fn send_special_day_announcement(ctx: &Context, occasion: SpecialDay) {
 	}
 }
 
+async fn is_supporter(ctx: &Context, config: &BotConfig, user_id: UserId) -> bool {
+	if config.owner_ids.contains(&user_id.get()) {
+		return true;
+	}
+
+	let guild_id = GuildId::new(config.target_guild_id);
+	let role_id = RoleId::new(config.supporter_role_id);
+
+	match guild_id.member(&ctx.http, user_id).await {
+		Ok(member) => member.roles.contains(&role_id),
+		Err(e) => {
+			eprintln!("Failed to check supporter role of {} in guild {}: {}", user_id, guild_id, e);
+			false
+		}
+	}
+}
+
+async fn enqueue_story_reply(ctx: &Context, msg: &Message) {
+	let queue_state = {
+		let data = ctx.data.read().await;
+		data.get::<SillyReplyQueueKey>().cloned().expect("SillyReplyQueue missing")
+	};
+
+	let mut users = queue_state.users.lock().unwrap();
+	let state = users.entry(msg.author.id.get()).or_insert_with(|| UserSillyReplyState {
+		queue: VecDeque::new(),
+		current_delay: Duration::from_secs(2),
+		next_allowed_time: Instant::now(),
+	});
+
+	// if the user's queue is empty, check if they've been idle to reset their delays
+	if state.queue.is_empty() {
+		let now = Instant::now();
+		if now > state.next_allowed_time {
+			// if they haven't sent a message in over 10s past their last timeout, fully reset their delay
+			if now.duration_since(state.next_allowed_time) > Duration::from_secs(10) {
+				state.current_delay = Duration::from_secs(2);
+			}
+			// apply their current delay starting from NOW
+			state.next_allowed_time = now + state.current_delay;
+		}
+	}
+
+	// hard-capped at 10,000 to prevent malicious out-of-memory attacks
+	if state.queue.len() < 10_000 {
+		state.queue.push_back(msg.clone());
+	}
+}
+
 fn say_unauthorized_response() -> CreateInteractionResponse {
 	CreateInteractionResponse::Message(
 		CreateInteractionResponseMessage::new()
@@ -1671,7 +1721,18 @@ impl EventHandler for Handler {
 			data.get::<ConfigKey>().cloned().expect("ConfigKey missing")
 		};
 
-		if msg.author.bot || msg.guild_id.is_none_or(|id| id.get() != config.target_guild_id) {
+		if msg.author.bot {
+			return;
+		}
+
+		if msg.guild_id.is_none() {
+			if is_supporter(&ctx, &config, msg.author.id).await {
+				enqueue_story_reply(&ctx, &msg).await;
+			}
+			return;
+		}
+
+		if msg.guild_id.is_none_or(|id| id.get() != config.target_guild_id) {
 			return;
 		}
 
@@ -1741,34 +1802,7 @@ impl EventHandler for Handler {
 		}
 
 		if msg.channel_id.get() == config.silly_channel_id {
-			let data = ctx.data.read().await;
-			let queue_state = data.get::<SillyReplyQueueKey>().cloned().expect("SillyReplyQueue missing");
-			drop(data);
-
-			let mut users = queue_state.users.lock().unwrap();
-			let state = users.entry(msg.author.id.get()).or_insert_with(|| UserSillyReplyState {
-				queue: VecDeque::new(),
-				current_delay: Duration::from_secs(2),
-				next_allowed_time: Instant::now(),
-			});
-
-			// if the user's queue is empty, check if they've been idle to reset their delays
-			if state.queue.is_empty() {
-				let now = Instant::now();
-				if now > state.next_allowed_time {
-					// if they haven't sent a message in over 10s past their last timeout, fully reset their delay
-					if now.duration_since(state.next_allowed_time) > Duration::from_secs(10) {
-						state.current_delay = Duration::from_secs(2);
-					}
-					// apply their current delay starting from NOW
-					state.next_allowed_time = now + state.current_delay;
-				}
-			}
-
-			// hard-capped at 10,000 to prevent malicious out-of-memory attacks
-			if state.queue.len() < 10_000 {
-				state.queue.push_back(msg.clone());
-			}
+			enqueue_story_reply(&ctx, &msg).await;
 		}
 
 		if let Some((today, occasion)) = special_day_announcement() {
@@ -1942,6 +1976,7 @@ async fn main() {
 		silly_channel_id: parse_env("SILLY_CHANNEL_ID"),
 		help_channel_id: parse_env("HELP_CHANNEL_ID"),
 		announce_channel_id: parse_env("ANNOUNCE_CHANNEL_ID"),
+		supporter_role_id: parse_env("SUPPORTER_ROLE_ID"),
 		server_ping_role_id: parse_env("SERVER_PING_ROLE_ID"),
 		gacha_ignore_user_id: parse_env("GACHA_IGNORE_USER_ID"),
 		appeal_url: parse_env("APPEAL_URL"),
@@ -2010,7 +2045,8 @@ async fn main() {
 	let token = std::env::var("TOKEN").expect("Missing TOKEN environment variable.");
 	let intents = GatewayIntents::GUILD_MESSAGES
 		| GatewayIntents::MESSAGE_CONTENT
-		| GatewayIntents::GUILD_MEMBERS;
+		| GatewayIntents::GUILD_MEMBERS
+		| GatewayIntents::DIRECT_MESSAGES;
 
 	let mut client = Client::builder(&token, intents)
 		.event_handler(Handler)
