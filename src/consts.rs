@@ -247,6 +247,8 @@ pub const SSR_ROLE_DROPS: &[RoleGachaDrop] = &[
 ];
 
 pub const UR_ROLE_DROPS: &[RoleGachaDrop] = &[
+	RoleGachaDrop { role_id: 1555803546417496075, label: "UE" },
+	RoleGachaDrop { role_id: 1555802307688398878, label: "UF9" },
 	RoleGachaDrop { role_id: 1488672177937977435, label: "UF" },
 	RoleGachaDrop { role_id: 1488672678440075354, label: "UG9" },
 	RoleGachaDrop { role_id: 1488672713005596682, label: "UG" },
