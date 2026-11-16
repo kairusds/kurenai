@@ -37,3 +37,4 @@ owners.txt
 # Voice lines
 snd_voi/*
 !snd_voi/.gitkeep
+!snd_voi/gen_filepaths.py
