@@ -33,3 +33,7 @@ phishing-links-ACTIVE.txt
 
 owners.txt
 .envrc
+
+# Voice lines
+snd_voi/*
+!snd_voi/.gitkeep
