@@ -1,7 +1,7 @@
 use serenity::{
 	async_trait,
 	builder::{
-		CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateEmbed,
+		CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption, CreateEmbed,
 		CreateEmbedAuthor, CreateEmbedFooter, CreateInputText, CreateInteractionResponse,
 		CreateInteractionResponseMessage, CreateMessage, CreateModal, CreateSelectMenu,
 		CreateSelectMenuKind, CreateSelectMenuOption, EditChannel, EditInteractionResponse,
@@ -10,9 +10,9 @@ use serenity::{
 	http::Http,
 	model::{
 		application::{
-			ActionRowComponent, ButtonStyle, CommandInteraction,
+			ActionRowComponent, ButtonStyle, CommandInteraction, CommandOptionType,
 			ComponentInteraction, ComponentInteractionDataKind, CommandType,
-			InputTextStyle, Interaction, ModalInteraction
+			InputTextStyle, Interaction, ModalInteraction, ResolvedValue
 		},
 		channel::*,
 		gateway::Ready,
@@ -24,6 +24,7 @@ use serenity::{
 };
 use std::{
 	collections::{HashMap, HashSet, VecDeque},
+	path::Path,
 	fs::{self, File},
 	io::{BufRead, BufReader, Cursor},
 	sync::{Arc, Mutex, RwLock, atomic::{AtomicU64, Ordering}},
@@ -39,7 +40,8 @@ use rand::{
 };
 use sha3::{Sha3_512, Digest};
 use zeroize_derive::{Zeroize, ZeroizeOnDrop};
-use chrono::{Datelike, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
+use rusqlite::{Connection, OptionalExtension, params};
 use chrono_tz::Asia::Tokyo;
 
 mod consts;
@@ -72,6 +74,7 @@ pub struct BotConfig {
 	pub silly_channel_id: u64,
 	pub help_channel_id: u64,
 	pub announce_channel_id: u64,
+	#[allow(dead_code)]
 	pub supporter_role_id: u64,
 	pub server_ping_role_id: u64,
 	pub gacha_ignore_user_id: u64,
@@ -290,6 +293,146 @@ struct AnnounceState {
 struct AnnounceKey;
 impl TypeMapKey for AnnounceKey {
 	type Value = Arc<AnnounceState>;
+}
+
+pub struct VoiceIndex {
+	pub available_paths: HashSet<String>,
+}
+
+struct VoiceIndexKey;
+impl TypeMapKey for VoiceIndexKey {
+	type Value = Arc<VoiceIndex>;
+}
+
+impl VoiceIndex {
+	pub fn load(index_path: &str, base_dir: &str) -> Self {
+		let mut available_paths = HashSet::new();
+		let Ok(raw) = fs::read_to_string(index_path) else {
+			eprintln!("Failed to read voice index {}", index_path);
+			return Self { available_paths };
+		};
+
+		let mut idx = 0;
+		let bytes = raw.as_bytes();
+		while idx < bytes.len() {
+			if bytes[idx] == b'"' {
+				if let Some(end) = raw[idx + 1..].find('"') {
+					let candidate = &raw[idx + 1..idx + 1 + end];
+					if candidate.ends_with(".m4a") && Path::new(base_dir).join(candidate).is_file() {
+						available_paths.insert(candidate.to_string());
+					}
+					idx += end + 2;
+					continue;
+				}
+			}
+			idx += 1;
+		}
+
+		println!("Voice index loaded. Available voice lines: {}", available_paths.len());
+		Self { available_paths }
+	}
+
+	pub fn contains(&self, rel_path: &str) -> bool {
+		self.available_paths.contains(rel_path)
+	}
+}
+
+fn is_in_jst_window(hour: u32, start_hour: u32, end_hour: u32) -> bool {
+	if start_hour <= end_hour {
+		hour >= start_hour && hour <= end_hour
+	} else {
+		hour >= start_hour || hour <= end_hour
+	}
+}
+
+fn find_voice_line(path: &str) -> Option<&'static VoiceLine> {
+	VOICE_LINES.iter().find(|vl| vl.path == path)
+}
+
+pub struct BirthdayDb {
+	conn: Mutex<Connection>,
+}
+
+struct BirthdayDbKey;
+impl TypeMapKey for BirthdayDbKey {
+	type Value = Arc<BirthdayDb>;
+}
+
+impl BirthdayDb {
+	pub fn open(path: &str) -> Self {
+		let conn = Connection::open(path).unwrap_or_else(|e| panic!("Failed to open {}: {}", path, e));
+		conn.execute(
+			"CREATE TABLE IF NOT EXISTS birthdays (
+				user_id INTEGER PRIMARY KEY,
+				month INTEGER NOT NULL,
+				day INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL
+			)",
+			[],
+		)
+		.unwrap_or_else(|e| panic!("Failed to initialize birthdays table in {}: {}", path, e));
+		Self { conn: Mutex::new(conn) }
+	}
+
+	pub fn try_set_once_per_year(&self, user_id: u64, month: u32, day: u32) -> Result<(), &'static str> {
+		let now = Utc::now();
+		let now_jst_year = now.with_timezone(&Tokyo).year();
+		let now_ts = now.timestamp();
+
+		let conn = self.conn.lock().unwrap();
+		let last_updated: Option<i64> = conn
+			.query_row(
+				"SELECT updated_at FROM birthdays WHERE user_id = ?1",
+				params![user_id as i64],
+				|row| row.get(0),
+			)
+			.optional()
+			.map_err(|_| "Failed to query birthday database.")?;
+
+		if let Some(ts) = last_updated {
+			if let Some(dt) = DateTime::from_timestamp(ts, 0) {
+				if dt.with_timezone(&Tokyo).year() == now_jst_year {
+					return Err("You can only set your birthday once per year (JST). You have already set it this year.");
+				}
+			}
+		}
+
+		conn.execute(
+			"INSERT INTO birthdays (user_id, month, day, updated_at)
+			 VALUES (?1, ?2, ?3, ?4)
+			 ON CONFLICT(user_id) DO UPDATE SET
+				month = excluded.month,
+				day = excluded.day,
+				updated_at = excluded.updated_at",
+			params![user_id as i64, month as i64, day as i64, now_ts],
+		)
+		.map_err(|_| "Failed to save your birthday.")?;
+
+		Ok(())
+	}
+
+	pub fn get_users_for_date(&self, month: u32, day: u32) -> Vec<u64> {
+		let conn = self.conn.lock().unwrap();
+		let Ok(mut stmt) = conn.prepare("SELECT user_id FROM birthdays WHERE month = ?1 AND day = ?2") else {
+			return Vec::new();
+		};
+		let Ok(rows) = stmt.query_map(params![month as i64, day as i64], |row| row.get::<_, i64>(0)) else {
+			return Vec::new();
+		};
+		rows.filter_map(Result::ok)
+			.filter_map(|id| u64::try_from(id).ok())
+			.collect()
+	}
+}
+
+fn is_valid_month_day(month: u32, day: u32) -> bool {
+	let max_day = match month {
+		1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+		4 | 6 | 9 | 11 => 30,
+		2 => 29,
+		_ => return false,
+	};
+	(1..=max_day).contains(&day)
 }
 
 async fn start_story_worker(ctx: Context, state: Arc<SillyReplyQueue>) {
@@ -1064,35 +1207,307 @@ async fn rename_trap_channel(ctx: &Context) {
 }
 
 async fn send_special_day_announcement(ctx: &Context, occasion: SpecialDay) {
-	let config = {
+	let (config, voice_index) = {
 		let data = ctx.data.read().await;
-		data.get::<ConfigKey>().cloned().expect("ConfigKey missing")
+		(
+			data.get::<ConfigKey>().cloned().expect("ConfigKey missing"),
+			data.get::<VoiceIndexKey>().cloned().expect("VoiceIndexKey missing"),
+		)
 	};
 
 	let channel_id = ChannelId::new(config.announce_channel_id);
-	let content = format!("<@&{}>\n{}", config.server_ping_role_id, occasion.line());
+	let available_seasonal: Vec<&VoiceLine> = occasion
+		.seasonal_voice_paths()
+		.iter()
+		.filter(|p| voice_index.contains(p))
+		.filter_map(|p| find_voice_line(p))
+		.collect();
 
-	match channel_id.say(&ctx.http, content).await {
+	let chosen = if available_seasonal.is_empty() {
+		None
+	} else {
+		Some(available_seasonal[rng_range(0..available_seasonal.len())])
+	};
+
+	let mut content = format!("<@&{}>\n{}", config.server_ping_role_id, occasion.line());
+	let mut builder = CreateMessage::new();
+
+	if let Some(vl) = chosen {
+		if let Some(translation) = vl.translation {
+			content.push_str(&format!("\n*{translation}*"));
+		}
+		let full_path = Path::new(VOICE_DIR).join(vl.path);
+		match CreateAttachment::path(&full_path).await {
+			Ok(attachment) => {
+				builder = builder.add_file(attachment);
+			}
+			Err(e) => {
+				eprintln!("Failed to attach seasonal voice line {:?}: {}", full_path, e);
+			}
+		}
+	}
+
+	builder = builder.content(content);
+
+	match channel_id.send_message(&ctx.http, builder).await {
 		Ok(_) => println!("Announced {} in channel {}", occasion.occasion(), channel_id),
 		Err(e) => eprintln!("Failed to announce {}: {}", occasion.occasion(), e),
 	}
 }
 
-async fn is_supporter(ctx: &Context, config: &BotConfig, user_id: UserId) -> bool {
+async fn is_guild_member(ctx: &Context, config: &BotConfig, user_id: UserId) -> bool {
 	if config.owner_ids.contains(&user_id.get()) {
 		return true;
 	}
 
 	let guild_id = GuildId::new(config.target_guild_id);
-	let role_id = RoleId::new(config.supporter_role_id);
-
 	match guild_id.member(&ctx.http, user_id).await {
-		Ok(member) => member.roles.contains(&role_id),
+		Ok(_) => true,
 		Err(e) => {
-			eprintln!("Failed to check supporter role of {} in guild {}: {}", user_id, guild_id, e);
+			eprintln!("Failed to check guild membership of {} in guild {}: {}", user_id, guild_id, e);
 			false
 		}
 	}
+}
+
+fn pick_random_general_or_time_voice(voice_index: &VoiceIndex, jst_hour: u32) -> Option<&'static VoiceLine> {
+	let pool: Vec<&'static VoiceLine> = VOICE_LINES
+		.iter()
+		.filter(|vl| voice_index.contains(vl.path))
+		.filter(|vl| match vl.category {
+			VoiceCategory::General => true,
+			VoiceCategory::TimeBased { start_hour, end_hour } => {
+				is_in_jst_window(jst_hour, start_hour, end_hour)
+			}
+			_ => false,
+		})
+		.collect();
+
+	if pool.is_empty() {
+		None
+	} else {
+		Some(pool[rng_range(0..pool.len())])
+	}
+}
+
+fn pick_random_bond_voice(voice_index: &VoiceIndex) -> Option<&'static VoiceLine> {
+	let pool: Vec<&'static VoiceLine> = VOICE_LINES
+		.iter()
+		.filter(|vl| voice_index.contains(vl.path))
+		.filter(|vl| matches!(vl.category, VoiceCategory::Bond { .. }))
+		.collect();
+
+	if pool.is_empty() {
+		None
+	} else {
+		Some(pool[rng_range(0..pool.len())])
+	}
+}
+
+fn compute_bond_chance(is_help_channel: bool, days_in_server: i64, bond_level: u8) -> f64 {
+	if is_help_channel {
+		return 0.0001;
+	}
+	let weeks = (days_in_server.max(0) / 7) as f64;
+	let scale = match bond_level {
+		1 => 1.0,
+		2 => 0.75,
+		_ => 0.5,
+	};
+	((0.001 + weeks * 0.001) * scale).clamp(0.001, 0.05)
+}
+
+async fn send_voice_line_reply(ctx: &Context, msg: &Message, vl: &VoiceLine) {
+	let full_path = Path::new(VOICE_DIR).join(vl.path);
+	let attachment = match CreateAttachment::path(&full_path).await {
+		Ok(att) => att,
+		Err(e) => {
+			eprintln!("Failed to open voice line {:?}: {}", full_path, e);
+			return;
+		}
+	};
+
+	let mut builder = CreateMessage::new()
+		.reference_message(msg)
+		.add_file(attachment);
+
+	if let Some(translation) = vl.translation {
+		builder = builder.content(format!("*{translation}*"));
+	}
+
+	if let Err(e) = msg.channel_id.send_message(&ctx.http, builder).await {
+		eprintln!("Failed to send voice line reply: {}", e);
+	}
+}
+
+async fn send_birthday_voice(
+	ctx: &Context,
+	user: &serenity::model::user::User,
+	silly_channel_id: ChannelId,
+	vl: &VoiceLine,
+) {
+	let full_path = Path::new(VOICE_DIR).join(vl.path);
+	let dm_attachment = match CreateAttachment::path(&full_path).await {
+		Ok(att) => att,
+		Err(e) => {
+			eprintln!("Failed to open birthday voice line {:?}: {}", full_path, e);
+			return;
+		}
+	};
+
+	let mut dm_builder = CreateMessage::new().add_file(dm_attachment);
+	if let Some(translation) = vl.translation {
+		dm_builder = dm_builder.content(format!("*{translation}*"));
+	}
+
+	if user.direct_message(&ctx.http, dm_builder).await.is_ok() {
+		return;
+	}
+
+	let fallback_attachment = match CreateAttachment::path(&full_path).await {
+		Ok(att) => att,
+		Err(e) => {
+			eprintln!("Failed to open fallback birthday voice line {:?}: {}", full_path, e);
+			return;
+		}
+	};
+
+	let content = match vl.translation {
+		Some(translation) => format!("{}\n*{translation}*", user.mention()),
+		None => user.mention().to_string(),
+	};
+
+	let fallback_builder = CreateMessage::new()
+		.content(content)
+		.add_file(fallback_attachment);
+
+	if let Err(e) = silly_channel_id.send_message(&ctx.http, fallback_builder).await {
+		eprintln!("Failed to send fallback birthday ping for {}: {}", user.id, e);
+	}
+}
+
+async fn start_birthday_worker(ctx: Context) {
+	let mut timer = interval(Duration::from_secs(30));
+	timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+	let mut last_checked_date: Option<(i32, u32, u32)> = None;
+
+	loop {
+		timer.tick().await;
+
+		let now = Utc::now().with_timezone(&Tokyo);
+		let today = (now.year(), now.month(), now.day());
+
+		if now.hour() != 0 || now.minute() != 0 || last_checked_date == Some(today) {
+			continue;
+		}
+		last_checked_date = Some(today);
+
+		let (config, voice_index, birthday_db) = {
+			let data = ctx.data.read().await;
+			(
+				data.get::<ConfigKey>().cloned().expect("ConfigKey missing"),
+				data.get::<VoiceIndexKey>().cloned().expect("VoiceIndexKey missing"),
+				data.get::<BirthdayDbKey>().cloned().expect("BirthdayDbKey missing"),
+			)
+		};
+
+		let guild_id = GuildId::new(config.target_guild_id);
+		let silly_channel_id = ChannelId::new(config.silly_channel_id);
+
+		// Still in Love's birthday (May 2 JST)
+		if now.month() == STILL_BIRTHDAY_MONTH && now.day() == STILL_BIRTHDAY_DAY {
+			let still_lines: Vec<&'static VoiceLine> = VOICE_LINES
+				.iter()
+				.filter(|vl| vl.category == VoiceCategory::StillBirthday && voice_index.contains(vl.path))
+				.collect();
+
+			if !still_lines.is_empty() {
+				let mut after: Option<UserId> = None;
+				loop {
+					let Ok(members) = guild_id.members(&ctx.http, Some(1000), after).await else {
+						break;
+					};
+					if members.is_empty() {
+						break;
+					}
+					after = members.last().map(|m| m.user.id);
+					for member in members {
+						if member.user.bot {
+							continue;
+						}
+						let vl = still_lines[rng_range(0..still_lines.len())];
+						send_birthday_voice(&ctx, &member.user, silly_channel_id, vl).await;
+					}
+				}
+			}
+		}
+
+		// Trainer's birthdays (matching MM-DD JST)
+		let trainer_lines: Vec<&'static VoiceLine> = VOICE_LINES
+			.iter()
+			.filter(|vl| vl.category == VoiceCategory::TrainerBirthday && voice_index.contains(vl.path))
+			.collect();
+
+		if !trainer_lines.is_empty() {
+			let matching_users = birthday_db.get_users_for_date(now.month(), now.day());
+
+			for uid in matching_users {
+				let user_id = UserId::new(uid);
+				if let Ok(member) = guild_id.member(&ctx.http, user_id).await {
+					if !member.user.bot {
+						let vl = trainer_lines[rng_range(0..trainer_lines.len())];
+						send_birthday_voice(&ctx, &member.user, silly_channel_id, vl).await;
+					}
+				}
+			}
+		}
+	}
+}
+
+async fn handle_birthday_command(ctx: &Context, command: CommandInteraction) {
+	let config = {
+		let data = ctx.data.read().await;
+		data.get::<ConfigKey>().cloned().expect("ConfigKey missing")
+	};
+
+	if !is_guild_member(ctx, &config, command.user.id).await {
+		let _ = command
+			.create_response(&ctx.http, say_unauthorized_response())
+			.await;
+		return;
+	}
+
+	let mut month: Option<u32> = None;
+	let mut day: Option<u32> = None;
+
+	for opt in command.data.options() {
+		match (opt.name, opt.value) {
+			("month", ResolvedValue::Integer(v)) => month = u32::try_from(v).ok(),
+			("day", ResolvedValue::Integer(v)) => day = u32::try_from(v).ok(),
+			_ => {}
+		}
+	}
+
+	let msg_text = match (month, day) {
+		(Some(m), Some(d)) if is_valid_month_day(m, d) => {
+			let db = {
+				let data = ctx.data.read().await;
+				data.get::<BirthdayDbKey>().cloned().expect("BirthdayDbKey missing")
+			};
+			match db.try_set_once_per_year(command.user.id.get(), m, d) {
+				Ok(()) => format!("Saved your birthday as {m:02}-{d:02} (JST)."),
+				Err(err_msg) => err_msg.to_string(),
+			}
+		}
+		_ => "Invalid month or day provided.".to_string(),
+	};
+
+	let response = CreateInteractionResponseMessage::new()
+		.content(msg_text)
+		.ephemeral(true);
+	let _ = command
+		.create_response(&ctx.http, CreateInteractionResponse::Message(response))
+		.await;
 }
 
 async fn enqueue_story_reply(ctx: &Context, msg: &Message) {
@@ -1726,7 +2141,7 @@ impl EventHandler for Handler {
 		}
 
 		if msg.guild_id.is_none() {
-			if is_supporter(&ctx, &config, msg.author.id).await {
+			if is_guild_member(&ctx, &config, msg.author.id).await {
 				enqueue_story_reply(&ctx, &msg).await;
 			}
 			return;
@@ -1789,15 +2204,79 @@ impl EventHandler for Handler {
 			}
 		}
 
-		// let content_lower = msg.content.to_lowercase();
+		let is_help_channel = msg.channel_id.get() == config.help_channel_id;
 		// 0.01% on help channel, 0.1% on all channels
-		let rate = if msg.channel_id.get() == config.help_channel_id { 0.0001 } else { 0.001 };
-		if should_show(rate) {
-			let index: usize = rng_range(0..config.silly_emojis.len());
-			let emoji = &config.silly_emojis[index];
-			let _ = msg.reply(&ctx.http, emoji).await;
-			if let Ok(reaction) = ReactionType::try_from(emoji.as_str()) {
-				let _ = msg.react(&ctx.http, reaction).await;
+		let rate = if is_help_channel { 0.0001 } else { 0.001 };
+
+		let voice_index = {
+			let data = ctx.data.read().await;
+			data.get::<VoiceIndexKey>().cloned().expect("VoiceIndexKey missing")
+		};
+		let jst_hour = Utc::now().with_timezone(&Tokyo).hour();
+
+		let emoji_hit = !config.silly_emojis.is_empty() && should_show(rate);
+		let general_voice = pick_random_general_or_time_voice(&voice_index, jst_hour);
+		let general_voice_hit = general_voice.is_some() && should_show(rate);
+
+		let bond_voice = pick_random_bond_voice(&voice_index);
+		let bond_voice_hit = if let Some(vl) = bond_voice {
+			let level = match vl.category {
+				VoiceCategory::Bond { level } => level,
+				_ => 1,
+			};
+			let days_in_server = msg
+				.member
+				.as_ref()
+				.and_then(|m| m.joined_at)
+				.map_or(0, |joined| {
+					(Timestamp::now().unix_timestamp() - joined.unix_timestamp()).max(0) / 86_400
+				});
+			let bond_rate = compute_bond_chance(is_help_channel, days_in_server, level);
+			should_show(bond_rate)
+		} else {
+			false
+		};
+
+		enum RandomReplyKind {
+			Emoji,
+			GeneralVoice(&'static VoiceLine),
+			BondVoice(&'static VoiceLine),
+		}
+
+		let mut candidates: Vec<RandomReplyKind> = Vec::new();
+		if emoji_hit {
+			candidates.push(RandomReplyKind::Emoji);
+		}
+		if general_voice_hit {
+			if let Some(vl) = general_voice {
+				candidates.push(RandomReplyKind::GeneralVoice(vl));
+			}
+		}
+		if bond_voice_hit {
+			if let Some(vl) = bond_voice {
+				candidates.push(RandomReplyKind::BondVoice(vl));
+			}
+		}
+
+		if !candidates.is_empty() {
+			let chosen = if candidates.len() == 1 {
+				&candidates[0]
+			} else {
+				&candidates[rng_range(0..candidates.len())]
+			};
+
+			match chosen {
+				RandomReplyKind::Emoji => {
+					let index: usize = rng_range(0..config.silly_emojis.len());
+					let emoji = &config.silly_emojis[index];
+					let _ = msg.reply(&ctx.http, emoji).await;
+					if let Ok(reaction) = ReactionType::try_from(emoji.as_str()) {
+						let _ = msg.react(&ctx.http, reaction).await;
+					}
+				}
+				RandomReplyKind::GeneralVoice(vl) | RandomReplyKind::BondVoice(vl) => {
+					send_voice_line_reply(&ctx, &msg, vl).await;
+				}
 			}
 		}
 
@@ -1911,12 +2390,36 @@ impl EventHandler for Handler {
 			start_story_worker(ctx_clone2, story_queue).await;
 		});
 
+		let ctx_clone3 = ctx.clone();
+		tokio::spawn(async move {
+			start_birthday_worker(ctx_clone3).await;
+		});
+
 		let say_command = CreateCommand::new(SAY_COMMAND_NAME)
 			.description("Make the bot say something (owners only)")
 			.kind(CommandType::ChatInput);
 
+		let birthday_command = CreateCommand::new(BIRTHDAY_COMMAND_NAME)
+			.description("Register your birthday (JST, once per year) for Still in Love's birthday wish")
+			.kind(CommandType::ChatInput)
+			.add_option(
+				CreateCommandOption::new(CommandOptionType::Integer, "month", "Birth month (1-12)")
+					.required(true)
+					.min_int_value(1)
+					.max_int_value(12),
+			)
+			.add_option(
+				CreateCommandOption::new(CommandOptionType::Integer, "day", "Birth day (1-31)")
+					.required(true)
+					.min_int_value(1)
+					.max_int_value(31),
+			);
+
 		for guild in &ready.guilds {
-			let _ = guild.id.set_commands(&ctx.http, vec![say_command.clone()]).await;
+			let _ = guild
+				.id
+				.set_commands(&ctx.http, vec![say_command.clone(), birthday_command.clone()])
+				.await;
 		}
 	}
 
@@ -1925,6 +2428,8 @@ impl EventHandler for Handler {
 			Interaction::Command(command) => {
 				if command.data.name == SAY_COMMAND_NAME {
 					handle_say_command(&ctx, command).await;
+				} else if command.data.name == BIRTHDAY_COMMAND_NAME {
+					handle_birthday_command(&ctx, command).await;
 				}
 			}
 			Interaction::Component(component) => handle_say_component(&ctx, component).await,
@@ -2032,6 +2537,9 @@ async fn main() {
 		drafts: Mutex::new(HashMap::new())
 	});
 
+	let voice_index = Arc::new(VoiceIndex::load(VOICE_INDEX_PATH, VOICE_DIR));
+	let birthday_db = Arc::new(BirthdayDb::open(DATA_DB_PATH));
+
 	let protect_clone = Arc::clone(&protect);
 	tokio::spawn(async move {
 		start_daily_download(
@@ -2065,6 +2573,8 @@ async fn main() {
 		data.insert::<BanTrackerKey>(ban_tracker);
 		data.insert::<CdnClientKey>(cdn_client);
 		data.insert::<SayBuilderKey>(say_builder);
+		data.insert::<VoiceIndexKey>(voice_index);
+		data.insert::<BirthdayDbKey>(birthday_db);
 	}
 
 	if let Err(why) = client.start().await {

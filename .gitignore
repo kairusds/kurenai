@@ -38,3 +38,7 @@ owners.txt
 snd_voi/*
 !snd_voi/.gitkeep
 !snd_voi/gen_filepaths.py
+
+# SQLite database
+data.db
+data.db-*
