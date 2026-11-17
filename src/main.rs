@@ -638,6 +638,20 @@ impl BirthdayDb {
 			.filter_map(|id| u64::try_from(id).ok())
 			.collect()
 	}
+
+
+	pub fn get_all_user_ids(&self) -> Vec<u64> {
+		let conn = self.conn.lock().unwrap();
+		let Ok(mut stmt) = conn.prepare("SELECT user_id FROM birthdays") else {
+			return Vec::new();
+		};
+		let Ok(rows) = stmt.query_map([], |row| row.get::<_, i64>(0)) else {
+			return Vec::new();
+		};
+		rows.filter_map(Result::ok)
+			.filter_map(|id| u64::try_from(id).ok())
+			.collect()
+	}
 }
 
 fn is_valid_month_day(month: u32, day: u32) -> bool {
@@ -2141,10 +2155,81 @@ async fn send_voice_line_reply(ctx: &Context, msg: &Message, vl: &VoiceLine) {
 	}
 }
 
+async fn maybe_send_random_reply(ctx: &Context, config: &BotConfig, msg: &Message, days_in_server: i64) {
+	let is_help_channel = msg.channel_id.get() == config.help_channel_id;
+	// 0.01% on help channel, 0.1% on all channels (including DMs)
+	let rate = if is_help_channel { 0.0001 } else { 0.001 };
+
+	let voice_index = {
+		let data = ctx.data.read().await;
+		data.get::<VoiceIndexKey>().cloned().expect("VoiceIndexKey missing")
+	};
+	let jst_hour = Utc::now().with_timezone(&Tokyo).hour();
+
+	let emoji_hit = !config.silly_emojis.is_empty() && should_show(rate);
+	let general_voice = pick_random_general_or_time_voice(&voice_index, jst_hour);
+	let general_voice_hit = general_voice.is_some() && should_show(rate);
+
+	let bond_voice = pick_random_bond_voice(&voice_index);
+	let bond_voice_hit = if let Some(vl) = bond_voice {
+		let level = match vl.category {
+			VoiceCategory::Bond { level } => level,
+			_ => 1,
+		};
+		let bond_rate = compute_bond_chance(is_help_channel, days_in_server, level);
+		should_show(bond_rate)
+	} else {
+		false
+	};
+
+	enum RandomReplyKind {
+		Emoji,
+		GeneralVoice(&'static VoiceLine),
+		BondVoice(&'static VoiceLine),
+	}
+
+	let mut candidates: Vec<RandomReplyKind> = Vec::new();
+	if emoji_hit {
+		candidates.push(RandomReplyKind::Emoji);
+	}
+	if general_voice_hit {
+		if let Some(vl) = general_voice {
+			candidates.push(RandomReplyKind::GeneralVoice(vl));
+		}
+	}
+	if bond_voice_hit {
+		if let Some(vl) = bond_voice {
+			candidates.push(RandomReplyKind::BondVoice(vl));
+		}
+	}
+
+	if !candidates.is_empty() {
+		let chosen = if candidates.len() == 1 {
+			&candidates[0]
+		} else {
+			&candidates[rng_range(0..candidates.len())]
+		};
+
+		match chosen {
+			RandomReplyKind::Emoji => {
+				let index: usize = rng_range(0..config.silly_emojis.len());
+				let emoji = &config.silly_emojis[index];
+				let _ = msg.reply(&ctx.http, emoji).await;
+				if let Ok(reaction) = ReactionType::try_from(emoji.as_str()) {
+					let _ = msg.react(&ctx.http, reaction).await;
+				}
+			}
+			RandomReplyKind::GeneralVoice(vl) | RandomReplyKind::BondVoice(vl) => {
+				send_voice_line_reply(ctx, msg, vl).await;
+			}
+		}
+	}
+}
+
 async fn send_birthday_voice(
 	ctx: &Context,
 	user: &serenity::model::user::User,
-	silly_channel_id: ChannelId,
+	fallback_channel_id: Option<ChannelId>,
 	vl: &VoiceLine,
 ) {
 	let full_path = Path::new(VOICE_DIR).join(vl.path);
@@ -2164,6 +2249,10 @@ async fn send_birthday_voice(
 	if user.direct_message(&ctx.http, dm_builder).await.is_ok() {
 		return;
 	}
+
+	let Some(silly_channel_id) = fallback_channel_id else {
+		return;
+	};
 
 	let fallback_attachment = match CreateAttachment::path(&full_path).await {
 		Ok(att) => att,
@@ -2215,7 +2304,7 @@ async fn start_birthday_worker(ctx: Context) {
 		let guild_id = GuildId::new(config.target_guild_id);
 		let silly_channel_id = ChannelId::new(config.silly_channel_id);
 
-		// Still in Love's birthday (May 2 JST)
+		// Still in Love's birthday (May 2 JST) - DM opted-in users only, no channel fallback
 		if now.month() == STILL_BIRTHDAY_MONTH && now.day() == STILL_BIRTHDAY_DAY {
 			let still_lines: Vec<&'static VoiceLine> = VOICE_LINES
 				.iter()
@@ -2223,21 +2312,14 @@ async fn start_birthday_worker(ctx: Context) {
 				.collect();
 
 			if !still_lines.is_empty() {
-				let mut after: Option<UserId> = None;
-				loop {
-					let Ok(members) = guild_id.members(&ctx.http, Some(1000), after).await else {
-						break;
-					};
-					if members.is_empty() {
-						break;
-					}
-					after = members.last().map(|m| m.user.id);
-					for member in members {
-						if member.user.bot {
-							continue;
+				let opted_in_users = birthday_db.get_all_user_ids();
+				for uid in opted_in_users {
+					let user_id = UserId::new(uid);
+					if let Ok(member) = guild_id.member(&ctx.http, user_id).await {
+						if !member.user.bot {
+							let vl = still_lines[rng_range(0..still_lines.len())];
+							send_birthday_voice(&ctx, &member.user, None, vl).await;
 						}
-						let vl = still_lines[rng_range(0..still_lines.len())];
-						send_birthday_voice(&ctx, &member.user, silly_channel_id, vl).await;
 					}
 				}
 			}
@@ -2257,7 +2339,7 @@ async fn start_birthday_worker(ctx: Context) {
 				if let Ok(member) = guild_id.member(&ctx.http, user_id).await {
 					if !member.user.bot {
 						let vl = trainer_lines[rng_range(0..trainer_lines.len())];
-						send_birthday_voice(&ctx, &member.user, silly_channel_id, vl).await;
+						send_birthday_voice(&ctx, &member.user, Some(silly_channel_id), vl).await;
 					}
 				}
 			}
@@ -2942,7 +3024,16 @@ impl EventHandler for Handler {
 		}
 
 		if msg.guild_id.is_none() {
-			if is_guild_member(&ctx, &config, msg.author.id).await {
+			let guild_id = GuildId::new(config.target_guild_id);
+			let member_res = guild_id.member(&ctx.http, msg.author.id).await;
+			if member_res.is_ok() || config.owner_ids.contains(&msg.author.id.get()) {
+				let days_in_server = member_res
+					.ok()
+					.and_then(|m| m.joined_at)
+					.map_or(0, |joined| {
+						(Timestamp::now().unix_timestamp() - joined.unix_timestamp()).max(0) / 86_400
+					});
+				maybe_send_random_reply(&ctx, &config, &msg, days_in_server).await;
 				enqueue_story_reply(&ctx, &msg).await;
 			}
 			return;
@@ -3005,81 +3096,14 @@ impl EventHandler for Handler {
 			}
 		}
 
-		let is_help_channel = msg.channel_id.get() == config.help_channel_id;
-		// 0.01% on help channel, 0.1% on all channels
-		let rate = if is_help_channel { 0.0001 } else { 0.001 };
-
-		let voice_index = {
-			let data = ctx.data.read().await;
-			data.get::<VoiceIndexKey>().cloned().expect("VoiceIndexKey missing")
-		};
-		let jst_hour = Utc::now().with_timezone(&Tokyo).hour();
-
-		let emoji_hit = !config.silly_emojis.is_empty() && should_show(rate);
-		let general_voice = pick_random_general_or_time_voice(&voice_index, jst_hour);
-		let general_voice_hit = general_voice.is_some() && should_show(rate);
-
-		let bond_voice = pick_random_bond_voice(&voice_index);
-		let bond_voice_hit = if let Some(vl) = bond_voice {
-			let level = match vl.category {
-				VoiceCategory::Bond { level } => level,
-				_ => 1,
-			};
-			let days_in_server = msg
-				.member
-				.as_ref()
-				.and_then(|m| m.joined_at)
-				.map_or(0, |joined| {
-					(Timestamp::now().unix_timestamp() - joined.unix_timestamp()).max(0) / 86_400
-				});
-			let bond_rate = compute_bond_chance(is_help_channel, days_in_server, level);
-			should_show(bond_rate)
-		} else {
-			false
-		};
-
-		enum RandomReplyKind {
-			Emoji,
-			GeneralVoice(&'static VoiceLine),
-			BondVoice(&'static VoiceLine),
-		}
-
-		let mut candidates: Vec<RandomReplyKind> = Vec::new();
-		if emoji_hit {
-			candidates.push(RandomReplyKind::Emoji);
-		}
-		if general_voice_hit {
-			if let Some(vl) = general_voice {
-				candidates.push(RandomReplyKind::GeneralVoice(vl));
-			}
-		}
-		if bond_voice_hit {
-			if let Some(vl) = bond_voice {
-				candidates.push(RandomReplyKind::BondVoice(vl));
-			}
-		}
-
-		if !candidates.is_empty() {
-			let chosen = if candidates.len() == 1 {
-				&candidates[0]
-			} else {
-				&candidates[rng_range(0..candidates.len())]
-			};
-
-			match chosen {
-				RandomReplyKind::Emoji => {
-					let index: usize = rng_range(0..config.silly_emojis.len());
-					let emoji = &config.silly_emojis[index];
-					let _ = msg.reply(&ctx.http, emoji).await;
-					if let Ok(reaction) = ReactionType::try_from(emoji.as_str()) {
-						let _ = msg.react(&ctx.http, reaction).await;
-					}
-				}
-				RandomReplyKind::GeneralVoice(vl) | RandomReplyKind::BondVoice(vl) => {
-					send_voice_line_reply(&ctx, &msg, vl).await;
-				}
-			}
-		}
+		let days_in_server = msg
+			.member
+			.as_ref()
+			.and_then(|m| m.joined_at)
+			.map_or(0, |joined| {
+				(Timestamp::now().unix_timestamp() - joined.unix_timestamp()).max(0) / 86_400
+			});
+		maybe_send_random_reply(&ctx, &config, &msg, days_in_server).await;
 
 		if msg.channel_id.get() == config.silly_channel_id {
 			enqueue_story_reply(&ctx, &msg).await;
