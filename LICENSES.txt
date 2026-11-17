@@ -549,7 +549,7 @@ For more information, please refer to <https://opendatacommons.org/licenses/odbl
 ---
 
 
-wearhericons
+weathericons
 - https://github.com/metno/weathericons
 
 The MIT License (MIT)
