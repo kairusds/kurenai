@@ -1,7 +1,7 @@
 use serenity::{
 	async_trait,
 	builder::{
-		CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption, CreateEmbed,
+		AutocompleteChoice, CreateActionRow, CreateAttachment, CreateAutocompleteResponse, CreateButton, CreateCommand, CreateCommandOption, CreateEmbed,
 		CreateEmbedAuthor, CreateEmbedFooter, CreateInputText, CreateInteractionResponse,
 		CreateInteractionResponseMessage, CreateMessage, CreateModal, CreateSelectMenu,
 		CreateSelectMenuKind, CreateSelectMenuOption, EditChannel, EditInteractionResponse,
@@ -42,6 +42,7 @@ use sha3::{Sha3_512, Digest};
 use zeroize_derive::{Zeroize, ZeroizeOnDrop};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Deserialize;
 use chrono_tz::Asia::Tokyo;
 
 mod consts;
@@ -74,6 +75,7 @@ pub struct BotConfig {
 	pub silly_channel_id: u64,
 	pub help_channel_id: u64,
 	pub announce_channel_id: u64,
+	pub bots_channel_id: u64,
 	#[allow(dead_code)]
 	pub supporter_role_id: u64,
 	pub server_ping_role_id: u64,
@@ -356,6 +358,219 @@ pub struct BirthdayDb {
 struct BirthdayDbKey;
 impl TypeMapKey for BirthdayDbKey {
 	type Value = Arc<BirthdayDb>;
+}
+
+#[derive(Deserialize)]
+struct RawCountry {
+	name: String,
+	#[serde(default)]
+	iso2: String,
+	#[serde(default)]
+	capital: String,
+	#[serde(default)]
+	latitude: Option<String>,
+	#[serde(default)]
+	longitude: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct CountryEntry {
+	pub name: String,
+	pub name_lower: String,
+	pub iso2_lower: String,
+	pub capital: String,
+	pub capital_lower: String,
+	pub lat: f64,
+	pub lon: f64,
+}
+
+pub struct CountryStore {
+	pub countries: Vec<CountryEntry>,
+}
+
+struct CountryStoreKey;
+impl TypeMapKey for CountryStoreKey {
+	type Value = Arc<CountryStore>;
+}
+
+impl CountryStore {
+	pub fn load(path: &str) -> Self {
+		let Ok(raw) = fs::read_to_string(path) else {
+			eprintln!("Failed to read {} - /weather country will be empty!", path);
+			return Self { countries: Vec::new() };
+		};
+		let Ok(parsed) = serde_json::from_str::<Vec<RawCountry>>(&raw) else {
+			eprintln!("Failed to parse {} as JSON", path);
+			return Self { countries: Vec::new() };
+		};
+
+		let mut countries = Vec::with_capacity(parsed.len());
+		for c in parsed {
+			let Some(lat) = c.latitude.as_deref().and_then(|s| s.trim().parse::<f64>().ok()) else {
+				continue;
+			};
+			let Some(lon) = c.longitude.as_deref().and_then(|s| s.trim().parse::<f64>().ok()) else {
+				continue;
+			};
+			countries.push(CountryEntry {
+				name_lower: c.name.to_lowercase(),
+				iso2_lower: c.iso2.to_lowercase(),
+				capital_lower: c.capital.to_lowercase(),
+				name: c.name,
+				capital: c.capital,
+				lat,
+				lon,
+			});
+		}
+		println!("Countries loaded. Total entries: {}", countries.len());
+		Self { countries }
+	}
+
+	pub fn find_by_name(&self, query: &str) -> Option<&CountryEntry> {
+		let q = query.trim().to_lowercase();
+		self.countries
+			.iter()
+			.find(|c| c.name_lower == q || c.iso2_lower == q)
+			.or_else(|| self.countries.iter().find(|c| c.name_lower.starts_with(&q)))
+	}
+
+	pub fn search_autocomplete(&self, query: &str) -> Vec<&CountryEntry> {
+		let q = query.trim().to_lowercase();
+		if q.is_empty() {
+			return self.countries.iter().take(25).collect();
+		}
+
+		let mut results: Vec<&CountryEntry> = Vec::with_capacity(25);
+		for c in &self.countries {
+			if c.name_lower.starts_with(&q) || c.capital_lower.starts_with(&q) || c.iso2_lower == q {
+				results.push(c);
+				if results.len() == 25 {
+					return results;
+				}
+			}
+		}
+		for c in &self.countries {
+			if !c.name_lower.starts_with(&q)
+				&& !c.capital_lower.starts_with(&q)
+				&& c.iso2_lower != q
+				&& (c.name_lower.contains(&q) || c.capital_lower.contains(&q))
+			{
+				results.push(c);
+				if results.len() == 25 {
+					break;
+				}
+			}
+		}
+		results
+	}
+}
+
+#[derive(Clone, Deserialize)]
+struct MetForecastResponse {
+	properties: MetProperties,
+}
+
+#[derive(Clone, Deserialize)]
+struct MetProperties {
+	timeseries: Vec<MetTimeseriesEntry>,
+}
+
+#[derive(Clone, Deserialize)]
+struct MetTimeseriesEntry {
+	time: String,
+	data: MetTimeseriesData,
+}
+
+#[derive(Clone, Deserialize)]
+struct MetTimeseriesData {
+	instant: MetInstant,
+	#[serde(default)]
+	next_1_hours: Option<MetNextHours>,
+	#[serde(default)]
+	next_6_hours: Option<MetNextHours>,
+}
+
+#[derive(Clone, Deserialize)]
+struct MetInstant {
+	details: MetInstantDetails,
+}
+
+#[derive(Clone, Deserialize)]
+struct MetInstantDetails {
+	#[serde(default)]
+	air_temperature: Option<f64>,
+	#[serde(default)]
+	apparent_air_temperature: Option<f64>,
+	#[serde(default)]
+	relative_humidity: Option<f64>,
+	#[serde(default)]
+	wind_speed: Option<f64>,
+	#[serde(default)]
+	wind_from_direction: Option<f64>,
+	#[serde(default)]
+	cloud_area_fraction: Option<f64>,
+	#[serde(default)]
+	air_pressure_at_sea_level: Option<f64>,
+}
+
+#[derive(Clone, Deserialize)]
+struct MetNextHoursDetails {
+	#[serde(default)]
+	precipitation_amount: Option<f64>,
+}
+
+#[derive(Clone, Deserialize)]
+struct MetNextHours {
+	summary: MetSummary,
+	#[serde(default)]
+	details: Option<MetNextHoursDetails>,
+}
+
+#[derive(Clone, Deserialize)]
+struct MetSummary {
+	symbol_code: String,
+}
+
+#[derive(Clone)]
+struct CachedForecast {
+	location_label: String,
+	lat_str: String,
+	lon_str: String,
+	altitude: Option<i32>,
+	forecast: MetForecastResponse,
+	expires_at: DateTime<Utc>,
+	last_modified: Option<String>,
+}
+
+type WeatherCacheKey = (String, String, Option<i32>);
+
+pub struct WeatherState {
+	cache: Mutex<HashMap<WeatherCacheKey, CachedForecast>>,
+	last_forecast: Mutex<Option<CachedForecast>>,
+	global_requests: Mutex<VecDeque<Instant>>,
+	user_last_request: Mutex<HashMap<u64, Instant>>,
+}
+
+struct WeatherStateKey;
+impl TypeMapKey for WeatherStateKey {
+	type Value = Arc<WeatherState>;
+}
+
+impl WeatherState {
+	pub fn new() -> Self {
+		Self {
+			cache: Mutex::new(HashMap::new()),
+			last_forecast: Mutex::new(None),
+			global_requests: Mutex::new(VecDeque::new()),
+			user_last_request: Mutex::new(HashMap::new()),
+		}
+	}
+}
+
+impl Default for WeatherState {
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 impl BirthdayDb {
@@ -1267,6 +1482,592 @@ async fn is_guild_member(ctx: &Context, config: &BotConfig, user_id: UserId) -> 
 			eprintln!("Failed to check guild membership of {} in guild {}: {}", user_id, guild_id, e);
 			false
 		}
+	}
+}
+
+async fn is_supporter(ctx: &Context, config: &BotConfig, user_id: UserId) -> bool {
+	if config.owner_ids.contains(&user_id.get()) {
+		return true;
+	}
+
+	let guild_id = GuildId::new(config.target_guild_id);
+	let role_id = RoleId::new(config.supporter_role_id);
+	match guild_id.member(&ctx.http, user_id).await {
+		Ok(member) => member.roles.contains(&role_id),
+		Err(_) => false,
+	}
+}
+
+fn wind_direction_arrow(deg: f64) -> &'static str {
+	let normalized = ((deg % 360.0) + 360.0) % 360.0;
+	let idx = ((normalized + 22.5) / 45.0).floor() as usize % 8;
+	match idx {
+		0 => "⬇ N",
+		1 => "↙ NE",
+		2 => "⬅ E",
+		3 => "↖ SE",
+		4 => "⬆ S",
+		5 => "↗ SW",
+		6 => "➡ W",
+		_ => "↘ NW",
+	}
+}
+
+fn weather_visuals(symbol_code: &str, temp_c: f64) -> (&'static str, &'static str, u32, &'static str, &'static str) {
+	let code = symbol_code.to_lowercase();
+	let (emoji, label, color, folder, lines): (&'static str, &'static str, u32, &'static str, &[&'static str]) =
+		if code.contains("thunder") {
+			(
+				"⛈️",
+				"Thunderstorm",
+				0x992D22,
+				"thunder",
+				&[
+					"The thunder is roaring... Ah don't look at me right now. 'That girl' is stirring with the storm... Hold my hand, Trainer-san, before the chain slips.",
+					"Lightning splits the dark, and my pulse won't slow down... Even if the sky tears open, you won't let go of me, will you?",
+				],
+			)
+		} else if code.contains("snow") || code.contains("sleet") {
+			(
+				"❄️",
+				"Snowy",
+				0xAED6F1,
+				"snow",
+				&[
+					"Snow is lovely... endlessly white and pure, like something I could only ever long for. Still, my fingers are cold... may I warm them in yours?",
+					"Everything outside is hushed beneath the snow. It's a gentle day for bitter coffee, warm sweets, and staying indoors together.",
+				],
+			)
+		} else if code.contains("rain") {
+			(
+				"🌧️",
+				"Rainy",
+				0x5499C7,
+				"rain",
+				&[
+					"The rain washes away the glare and hides us from the world... With my presence so faint, nobody else will notice us beneath one umbrella.",
+					"Raindrops tapping against the window... Please stay inside with me today. I brewed dark coffee and made something sweet for you.",
+				],
+			)
+		} else if code.contains("fog") {
+			(
+				"🌫️",
+				"Foggy",
+				0x95A5A6,
+				"fog",
+				&[
+					"The mist is so thick that even I feel like I'm dissolving into it... Yet even in the deepest fog, I will always find you, Trainer-san.",
+					"Wrapped in haze, nobody can see what lies beneath the surface. Don't worry, just follow my voice.",
+				],
+			)
+		} else if code.contains("partlycloudy") && code.contains("night") {
+			(
+				"🌙",
+				"Partly Cloudy Night",
+				0x2C3E50,
+				"clearsky_night",
+				&[
+					"The night is kind, and the drifting clouds hide what shouldn't be seen... Though if the full moon peeks through, 'that girl' might wake.",
+					"I was stargazing earlier... Between the clouds, the night sky feels quiet enough for just the two of us.",
+				],
+			)
+		} else if code.contains("partlycloudy") {
+			(
+				"⛅",
+				"Partly Cloudy",
+				0x5DADE2,
+				"partlycloudy_day",
+				&[
+					"The clouds are softening the sunlight just enough... If I stay right inside your shadow, maybe we can walk a little longer.",
+					"Sunlight and shade taking turns... Days like this make it easier to keep my veil lowered and breathe.",
+				],
+			)
+		} else if code.contains("cloudy") {
+			(
+				"☁️",
+				"Cloudy",
+				0x7F8C8D,
+				"cloudy",
+				&[
+					"The harsh sun is hidden behind thick clouds today... My skin and my heart both feel much calmer like this.",
+					"A quiet, overcast sky... Nobody notices someone as faint-presenced as me on days like this, which makes being by your side even more peaceful.",
+				],
+			)
+		} else if code.contains("night") {
+			(
+				"🌙",
+				"Clear Night",
+				0x2C3E50,
+				"clearsky_night",
+				&[
+					"In the dark, my figure melts right into the night... Shall I keep humming softly so you always know where I am?",
+					"No harsh light, no prying eyes... just the stars and you. Even if we're swallowed by the night, we're together.",
+				],
+			)
+		} else if temp_c >= 30.0 {
+			(
+				"☀️",
+				"Hot & Sunny",
+				0xE67E22,
+				"hot",
+				&[
+					"Such blinding heat... Even with dark clothes and my veil, it's too bright. Please let me hide in your shadow, Trainer-san...",
+					"The heat is making my head dizzy and my heart race... Let's slip into the shade for some shaved ice or cold tomato juice before 'that girl' gets restless.",
+				],
+			)
+		} else {
+			(
+				"☀️",
+				"Clear & Sunny",
+				0xF5B041,
+				"clearsky_day",
+				&[
+					"The sky is so bright and clear... Sunlight usually makes me shrink back, yet somehow looking at you feels just as warm.",
+					"A dazzling day... Keep me close under your parasol, Trainer-san, so I don't fade into the glare.",
+				],
+			)
+		};
+	let line = lines[rng_range(0..lines.len())];
+	(emoji, label, color, folder, line)
+}
+
+fn pick_random_weather_image(folder: &str) -> Option<(String, std::path::PathBuf)> {
+	let dir = Path::new(WEATHER_DIR).join(folder);
+	let Ok(entries) = fs::read_dir(&dir) else {
+		return None;
+	};
+	let files: Vec<std::path::PathBuf> = entries
+		.filter_map(Result::ok)
+		.map(|e| e.path())
+		.filter(|p| {
+			p.is_file()
+				&& p.extension()
+					.and_then(|e| e.to_str())
+					.is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png" | "webp"))
+		})
+		.collect();
+
+	if files.is_empty() {
+		return None;
+	}
+	let chosen = files[rng_range(0..files.len())].clone();
+	let ext = chosen
+		.extension()
+		.and_then(|e| e.to_str())
+		.unwrap_or("jpg")
+		.to_ascii_lowercase();
+	Some((format!("weather_bg.{ext}"), chosen))
+}
+
+async fn handle_weather_autocomplete(ctx: &Context, autocomplete: CommandInteraction) {
+	if autocomplete.data.name != WEATHER_COMMAND_NAME {
+		return;
+	}
+
+	let Some(focused) = autocomplete.data.autocomplete() else {
+		return;
+	};
+	if focused.name != "name" {
+		return;
+	}
+
+	let store = {
+		let data = ctx.data.read().await;
+		data.get::<CountryStoreKey>().cloned().expect("CountryStoreKey missing")
+	};
+
+	let matches = store.search_autocomplete(focused.value);
+	let choices: Vec<AutocompleteChoice> = matches
+		.into_iter()
+		.map(|c| {
+			let mut label = if c.capital.is_empty() {
+				c.name.clone()
+			} else {
+				format!("{} ({})", c.name, c.capital)
+			};
+			if label.chars().count() > 100 {
+				label = label.chars().take(97).collect::<String>() + "...";
+			}
+			AutocompleteChoice::new(label, c.name.clone())
+		})
+		.collect();
+
+	let response = CreateAutocompleteResponse::new().set_choices(choices);
+	let _ = autocomplete
+		.create_response(&ctx.http, CreateInteractionResponse::Autocomplete(response))
+		.await;
+}
+
+async fn handle_weather_command(ctx: &Context, command: CommandInteraction) {
+	let (config, country_store, weather_state, client) = {
+		let data = ctx.data.read().await;
+		(
+			data.get::<ConfigKey>().cloned().expect("ConfigKey missing"),
+			data.get::<CountryStoreKey>().cloned().expect("CountryStoreKey missing"),
+			data.get::<WeatherStateKey>().cloned().expect("WeatherStateKey missing"),
+			data.get::<CdnClientKey>().cloned().expect("CdnClientKey missing"),
+		)
+	};
+
+	if command.guild_id.is_none() && !is_guild_member(ctx, &config, command.user.id).await {
+		let _ = command.create_response(&ctx.http, say_unauthorized_response()).await;
+		return;
+	}
+
+	if command.guild_id.is_some() && command.channel_id.get() != config.bots_channel_id {
+		let _ = command
+			.create_response(
+				&ctx.http,
+				CreateInteractionResponse::Message(
+					CreateInteractionResponseMessage::new()
+						.content(format!("Please use `/weather` in <#{}>.", config.bots_channel_id))
+						.ephemeral(true),
+				),
+			)
+			.await;
+		return;
+	}
+
+	let mut location_label = String::new();
+	let mut lat_opt: Option<f64> = None;
+	let mut lon_opt: Option<f64> = None;
+	let mut alt_opt: Option<i32> = None;
+
+	for opt in command.data.options() {
+		match (opt.name, opt.value) {
+			("country", ResolvedValue::SubCommand(sub_opts)) => {
+				for sub in sub_opts {
+					if sub.name == "name" {
+						if let ResolvedValue::String(name) = sub.value {
+							if let Some(entry) = country_store.find_by_name(name) {
+								location_label = if entry.capital.is_empty() {
+									entry.name.clone()
+								} else {
+									format!("{}, {}", entry.capital, entry.name)
+								};
+								lat_opt = Some(entry.lat);
+								lon_opt = Some(entry.lon);
+							}
+						}
+					}
+				}
+			}
+			("coords", ResolvedValue::SubCommand(sub_opts)) => {
+				for sub in sub_opts {
+					match (sub.name, sub.value) {
+						("lat", ResolvedValue::Number(v)) => lat_opt = Some(v),
+						("lon", ResolvedValue::Number(v)) => lon_opt = Some(v),
+						("altitude", ResolvedValue::Integer(v)) => alt_opt = i32::try_from(v).ok(),
+						_ => {}
+					}
+				}
+				if let (Some(la), Some(lo)) = (lat_opt, lon_opt) {
+					location_label = format!("{la:.4}, {lo:.4}");
+				}
+			}
+			_ => {}
+		}
+	}
+
+	let (Some(lat), Some(lon)) = (lat_opt, lon_opt) else {
+		let _ = command
+			.create_response(
+				&ctx.http,
+				CreateInteractionResponse::Message(
+					CreateInteractionResponseMessage::new()
+						.content("Could not find that location. Please pick a country from autocomplete or provide valid coordinates.")
+						.ephemeral(true),
+				),
+			)
+			.await;
+		return;
+	};
+
+	if command.defer(&ctx.http).await.is_err() {
+		return;
+	}
+
+	let lat_str = format!("{lat:.4}");
+	let lon_str = format!("{lon:.4}");
+	let cache_key = (lat_str.clone(), lon_str.clone(), alt_opt);
+	let now_utc = Utc::now();
+
+	let cached_entry = {
+		let cache = weather_state.cache.lock().unwrap();
+		cache.get(&cache_key).cloned()
+	};
+
+	let mut rate_limit_note: Option<String> = None;
+	let forecast_to_show = if let Some(ref hit) = cached_entry {
+		if now_utc < hit.expires_at {
+			Some(hit.clone())
+		} else {
+			None
+		}
+	} else {
+		None
+	};
+
+	let final_forecast = if let Some(valid_hit) = forecast_to_show {
+		Some(valid_hit)
+	} else {
+		let supporter = is_supporter(ctx, &config, command.user.id).await;
+		let user_cooldown = Duration::from_secs(if supporter {
+			WEATHER_SUPPORTER_COOLDOWN_SECS
+		} else {
+			WEATHER_USER_COOLDOWN_SECS
+		});
+
+		let now_inst = Instant::now();
+		let user_wait = {
+			let mut users = weather_state.user_last_request.lock().unwrap();
+			if let Some(&last_ts) = users.get(&command.user.id.get()) {
+				let elapsed = now_inst.saturating_duration_since(last_ts);
+				if elapsed < user_cooldown {
+					Some((user_cooldown - elapsed).as_secs().max(1))
+				} else {
+					users.insert(command.user.id.get(), now_inst);
+					None
+				}
+			} else {
+				users.insert(command.user.id.get(), now_inst);
+				None
+			}
+		};
+
+		let global_limited = if user_wait.is_none() {
+			let mut global = weather_state.global_requests.lock().unwrap();
+			let window = Duration::from_secs(WEATHER_GLOBAL_WINDOW_SECS);
+			while let Some(&front) = global.front() {
+				if now_inst.saturating_duration_since(front) >= window {
+					global.pop_front();
+				} else {
+					break;
+				}
+			}
+			if global.len() >= WEATHER_GLOBAL_LIMIT {
+				true
+			} else {
+				global.push_back(now_inst);
+				false
+			}
+		} else {
+			false
+		};
+
+		if let Some(wait_secs) = user_wait {
+			rate_limit_note = Some(format!(
+				"Personal cooldown active ({wait_secs}s left), showing last cached forecast."
+			));
+			weather_state.last_forecast.lock().unwrap().clone()
+		} else if global_limited {
+			rate_limit_note = Some(
+				"Global weather limit reached (30/min), showing last cached forecast.".to_string(),
+			);
+			weather_state.last_forecast.lock().unwrap().clone()
+		} else {
+			let mut url = format!(
+				"https://api.met.no/weatherapi/locationforecast/2.0/compact?lat={lat_str}&lon={lon_str}"
+			);
+			if let Some(alt) = alt_opt {
+				url.push_str(&format!("&altitude={alt}"));
+			}
+
+			let mut req = client.get(&url).header(reqwest::header::USER_AGENT, MET_USER_AGENT);
+			if let Some(ref prev) = cached_entry {
+				if let Some(ref lm) = prev.last_modified {
+					req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
+				}
+			}
+
+			match req.send().await {
+				Ok(resp) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {
+					if let Some(mut prev) = cached_entry {
+						let new_expires = resp
+							.headers()
+							.get(reqwest::header::EXPIRES)
+							.and_then(|v| v.to_str().ok())
+							.and_then(|s| DateTime::parse_from_rfc2822(s).ok())
+							.map(|dt| dt.with_timezone(&Utc))
+							.unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(30));
+						prev.expires_at = new_expires;
+						weather_state.cache.lock().unwrap().insert(cache_key.clone(), prev.clone());
+						*weather_state.last_forecast.lock().unwrap() = Some(prev.clone());
+						Some(prev)
+					} else {
+						None
+					}
+				}
+				Ok(resp) if resp.status().is_success() => {
+					let expires_at = resp
+						.headers()
+						.get(reqwest::header::EXPIRES)
+						.and_then(|v| v.to_str().ok())
+						.and_then(|s| DateTime::parse_from_rfc2822(s).ok())
+						.map(|dt| dt.with_timezone(&Utc))
+						.unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(30));
+					let last_modified = resp
+						.headers()
+						.get(reqwest::header::LAST_MODIFIED)
+						.and_then(|v| v.to_str().ok())
+						.map(str::to_string);
+
+					match resp.bytes().await {
+						Ok(bytes) => match serde_json::from_slice::<MetForecastResponse>(&bytes) {
+							Ok(forecast) => {
+								let entry = CachedForecast {
+									location_label: location_label.clone(),
+									lat_str,
+									lon_str,
+									altitude: alt_opt,
+									forecast,
+									expires_at,
+									last_modified,
+								};
+								weather_state.cache.lock().unwrap().insert(cache_key, entry.clone());
+								*weather_state.last_forecast.lock().unwrap() = Some(entry.clone());
+								Some(entry)
+							}
+							Err(e) => {
+								eprintln!("Failed to parse MET JSON: {}", e);
+								None
+							}
+						},
+						Err(e) => {
+							eprintln!("Failed to read MET response body: {}", e);
+							None
+						}
+					}
+				}
+				Ok(resp) => {
+					eprintln!("MET API returned status {}", resp.status());
+					None
+				}
+				Err(e) => {
+					eprintln!("MET API request failed: {}", e);
+					None
+				}
+			}
+		}
+	};
+
+	let Some(entry) = final_forecast else {
+		let msg = rate_limit_note.unwrap_or_else(|| {
+			"Failed to fetch weather data from MET Norway. Please try again shortly.".to_string()
+		});
+		let _ = command
+			.edit_response(&ctx.http, EditInteractionResponse::new().content(msg))
+			.await;
+		return;
+	};
+
+	let Some(current) = entry.forecast.properties.timeseries.first() else {
+		let _ = command
+			.edit_response(
+				&ctx.http,
+				EditInteractionResponse::new().content("MET Norway returned an empty forecast."),
+			)
+			.await;
+		return;
+	};
+
+	let details = &current.data.instant.details;
+	let air_temp = details.air_temperature.unwrap_or(0.0);
+	let apparent_temp = details.apparent_air_temperature.unwrap_or(air_temp);
+	let humidity = details.relative_humidity.unwrap_or(0.0);
+	let wind_speed = details.wind_speed.unwrap_or(0.0);
+	let wind_dir = details.wind_from_direction.unwrap_or(0.0);
+	let cloud_cover = details.cloud_area_fraction.unwrap_or(0.0);
+	let pressure_hpa = details.air_pressure_at_sea_level.unwrap_or(1013.2);
+	let precip_1h = current
+		.data
+		.next_1_hours
+		.as_ref()
+		.and_then(|n| n.details.as_ref())
+		.and_then(|d| d.precipitation_amount)
+		.unwrap_or(0.0);
+	let symbol_code = current
+		.data
+		.next_1_hours
+		.as_ref()
+		.or(current.data.next_6_hours.as_ref())
+		.map_or("clearsky_day", |n| n.summary.symbol_code.as_str());
+
+	let (emoji, condition_label, color, folder, mood_line) = weather_visuals(symbol_code, air_temp);
+	let coord_text = match entry.altitude {
+		Some(alt) => format!("{}, {} ({}m)", entry.lat_str, entry.lon_str, alt),
+		None => format!("{}, {}", entry.lat_str, entry.lon_str),
+	};
+
+	let mut description = format!("*{mood_line}*");
+	if let Some(note) = rate_limit_note {
+		description.push_str(&format!("\n\n**{note}**"));
+	}
+
+	let updated_jst = DateTime::parse_from_rfc3339(&current.time)
+		.map(|dt| dt.with_timezone(&Tokyo).format("%H:%M JST").to_string())
+		.unwrap_or_else(|_| Utc::now().with_timezone(&Tokyo).format("%H:%M JST").to_string());
+
+	let mut author = CreateEmbedAuthor::new(format!("{} ({coord_text})", entry.location_label))
+		.url("https://api.met.no/");
+
+	let mut attachments: Vec<CreateAttachment> = Vec::new();
+
+	let icon_path = Path::new(WEATHER_ICONS_DIR).join(format!("{symbol_code}.png"));
+	if icon_path.is_file() {
+		if let Ok(icon_att) = CreateAttachment::path(&icon_path).await {
+			let mut renamed = icon_att;
+			renamed.filename = "weather_icon.png".to_string();
+			attachments.push(renamed);
+			author = author.icon_url("attachment://weather_icon.png");
+		}
+	}
+
+	let mut embed = CreateEmbed::new()
+		.author(author)
+		.title(format!("{emoji} {condition_label} - {air_temp:.1}°C"))
+		.description(description)
+		.color(color)
+		.field("🌡️ Feels Like", format!("{apparent_temp:.1}°C"), true)
+		.field("💧 Humidity", format!("{humidity:.0}%"), true)
+		.field("💨 Wind", format!("{wind_speed:.1} m/s {}", wind_direction_arrow(wind_dir)), true)
+		.field("☁️ Cloud Cover", format!("{cloud_cover:.0}%"), true)
+		.field("🌧️ Next 1h Rain", format!("{precip_1h:.1} mm"), true)
+		.field("🧭 Pressure", format!("{pressure_hpa:.0} hPa"), true);
+
+	if let Some(ref next_6h) = current.data.next_6_hours {
+		let (n6_emoji, n6_label, _, _, _) = weather_visuals(&next_6h.summary.symbol_code, air_temp);
+		let n6_precip = next_6h
+			.details
+			.as_ref()
+			.and_then(|d| d.precipitation_amount)
+			.unwrap_or(0.0);
+		embed = embed.field(
+			"🕒 6h Outlook",
+			format!("{n6_emoji} {n6_label} ({n6_precip:.1} mm)"),
+			false,
+		);
+	}
+
+	embed = embed.footer(CreateEmbedFooter::new(format!(
+		"Weather data by MET Norway (api.met.no) • {updated_jst}"
+	)));
+
+	if let Some((att_name, bg_path)) = pick_random_weather_image(folder) {
+		if let Ok(mut bg_att) = CreateAttachment::path(&bg_path).await {
+			bg_att.filename = att_name.clone();
+			attachments.push(bg_att);
+			embed = embed.image(format!("attachment://{att_name}"));
+		}
+	}
+
+	let mut edit = EditInteractionResponse::new().embed(embed);
+	for att in attachments {
+		edit = edit.new_attachment(att);
+	}
+
+	if let Err(e) = command.edit_response(&ctx.http, edit).await {
+		eprintln!("Failed to send /weather response: {}", e);
 	}
 }
 
@@ -2415,6 +3216,65 @@ impl EventHandler for Handler {
 					.max_int_value(31),
 			);
 
+		let weather_command = CreateCommand::new(WEATHER_COMMAND_NAME)
+			.description("Check the current weather via MET Norway")
+			.kind(CommandType::ChatInput)
+			.add_option(
+				CreateCommandOption::new(
+					CommandOptionType::SubCommand,
+					"country",
+					"Get weather for a country's capital",
+				)
+				.add_sub_option(
+					CreateCommandOption::new(
+						CommandOptionType::String,
+						"name",
+						"Country name or ISO2 code",
+					)
+					.required(true)
+					.set_autocomplete(true),
+				),
+			)
+			.add_option(
+				CreateCommandOption::new(
+					CommandOptionType::SubCommand,
+					"coords",
+					"Get weather by latitude, longitude, and optional altitude",
+				)
+				.add_sub_option(
+					CreateCommandOption::new(
+						CommandOptionType::Number,
+						"lat",
+						"Latitude (-90 to 90)",
+					)
+					.required(true)
+					.min_number_value(-90.0)
+					.max_number_value(90.0),
+				)
+				.add_sub_option(
+					CreateCommandOption::new(
+						CommandOptionType::Number,
+						"lon",
+						"Longitude (-180 to 180)",
+					)
+					.required(true)
+					.min_number_value(-180.0)
+					.max_number_value(180.0),
+				)
+				.add_sub_option(
+					CreateCommandOption::new(
+						CommandOptionType::Integer,
+						"altitude",
+						"Optional ground elevation in meters above sea level",
+					)
+					.required(false)
+					.min_int_value(0)
+					.max_int_value(9000),
+				),
+			);
+
+		let _ = serenity::model::application::Command::set_global_commands(&ctx.http, vec![weather_command]).await;
+
 		for guild in &ready.guilds {
 			let _ = guild
 				.id
@@ -2430,7 +3290,12 @@ impl EventHandler for Handler {
 					handle_say_command(&ctx, command).await;
 				} else if command.data.name == BIRTHDAY_COMMAND_NAME {
 					handle_birthday_command(&ctx, command).await;
+				} else if command.data.name == WEATHER_COMMAND_NAME {
+					handle_weather_command(&ctx, command).await;
 				}
+			}
+			Interaction::Autocomplete(autocomplete) => {
+				handle_weather_autocomplete(&ctx, autocomplete).await;
 			}
 			Interaction::Component(component) => handle_say_component(&ctx, component).await,
 			Interaction::Modal(modal) => handle_say_modal(&ctx, modal).await,
@@ -2481,6 +3346,7 @@ async fn main() {
 		silly_channel_id: parse_env("SILLY_CHANNEL_ID"),
 		help_channel_id: parse_env("HELP_CHANNEL_ID"),
 		announce_channel_id: parse_env("ANNOUNCE_CHANNEL_ID"),
+		bots_channel_id: parse_env("BOTS_CHANNEL_ID"),
 		supporter_role_id: parse_env("SUPPORTER_ROLE_ID"),
 		server_ping_role_id: parse_env("SERVER_PING_ROLE_ID"),
 		gacha_ignore_user_id: parse_env("GACHA_IGNORE_USER_ID"),
@@ -2539,6 +3405,8 @@ async fn main() {
 
 	let voice_index = Arc::new(VoiceIndex::load(VOICE_INDEX_PATH, VOICE_DIR));
 	let birthday_db = Arc::new(BirthdayDb::open(DATA_DB_PATH));
+	let country_store = Arc::new(CountryStore::load(COUNTRIES_JSON_PATH));
+	let weather_state = Arc::new(WeatherState::new());
 
 	let protect_clone = Arc::clone(&protect);
 	tokio::spawn(async move {
@@ -2575,6 +3443,8 @@ async fn main() {
 		data.insert::<SayBuilderKey>(say_builder);
 		data.insert::<VoiceIndexKey>(voice_index);
 		data.insert::<BirthdayDbKey>(birthday_db);
+		data.insert::<CountryStoreKey>(country_store);
+		data.insert::<WeatherStateKey>(weather_state);
 	}
 
 	if let Err(why) = client.start().await {

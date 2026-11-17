@@ -6,6 +6,15 @@ pub const DATA_DB_PATH: &str = "data.db";
 pub const BIRTHDAY_COMMAND_NAME: &str = "birthday";
 pub const STILL_BIRTHDAY_MONTH: u32 = 5;
 pub const STILL_BIRTHDAY_DAY: u32 = 2;
+pub const WEATHER_COMMAND_NAME: &str = "weather";
+pub const COUNTRIES_JSON_PATH: &str = "countries.json";
+pub const WEATHER_DIR: &str = "weather";
+pub const WEATHER_ICONS_DIR: &str = "weathericons/weather/png";
+pub const MET_USER_AGENT: &str = "kurenai/0.3 (https://github.com/kairusds/kurenai)";
+pub const WEATHER_GLOBAL_LIMIT: usize = 30;
+pub const WEATHER_GLOBAL_WINDOW_SECS: u64 = 60;
+pub const WEATHER_USER_COOLDOWN_SECS: u64 = 120;
+pub const WEATHER_SUPPORTER_COOLDOWN_SECS: u64 = 60;
 
 pub const MAX_FETCH_PAGES_PER_CHANNEL: usize = 10;
 

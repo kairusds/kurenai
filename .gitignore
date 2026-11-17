@@ -42,3 +42,7 @@ snd_voi/*
 # SQLite database
 data.db
 data.db-*
+
+# Weather screenshots
+weather/*/*
+!weather/*/.gitkeep
