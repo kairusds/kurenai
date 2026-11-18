@@ -698,7 +698,7 @@ async fn start_story_worker(ctx: Context, state: Arc<SillyReplyQueue>) {
 
 			if let Some(random_quote) = stories.get_random() {
 				let final_quote = random_quote.replace("<chrname>", &msg.author.name);
-				let _ = msg.reply(&ctx.http, final_quote).await;
+				let _ = msg.reply_ping(&ctx.http, final_quote).await;
 			}
 		}
 	}
@@ -2214,7 +2214,7 @@ async fn maybe_send_random_reply(ctx: &Context, config: &BotConfig, msg: &Messag
 			RandomReplyKind::Emoji => {
 				let index: usize = rng_range(0..config.silly_emojis.len());
 				let emoji = &config.silly_emojis[index];
-				let _ = msg.reply(&ctx.http, emoji).await;
+				let _ = msg.reply_ping(&ctx.http, emoji).await;
 				if let Ok(reaction) = ReactionType::try_from(emoji.as_str()) {
 					let _ = msg.react(&ctx.http, reaction).await;
 				}
@@ -3147,7 +3147,7 @@ impl EventHandler for Handler {
 
 						let index: usize = rng_range(0..ur_messages.len());
 						let response = ur_messages[index].replace("{}", outcome.label);
-						let _ = msg.reply(&ctx.http, response).await;
+						let _ = msg.reply_ping(&ctx.http, response).await;
 					} else if tier_name == "SSR" {
 						let ssr_messages = [
 							"...Congratulations, Trainer-san. You managed to welcome [SSR] {}. Seeing your joyful expression makes me... so very happy, too. ...Please, let me stay by your side and watch you... mooore...",
@@ -3156,11 +3156,11 @@ impl EventHandler for Handler {
 
 						let index: usize = rng_range(0..ssr_messages.len());
 						let response = ssr_messages[index].replace("{}", outcome.label);
-						let _ = msg.reply(&ctx.http, response).await;
+						let _ = msg.reply_ping(&ctx.http, response).await;
 					} else if tier_name == "SR" {
-						let _ = msg.reply(&ctx.http, format!("...My, you got [SR] {}. That is wonderful, isn't it. ...Fufu, whether the result is grand or modest, as long as I can share this time with you... I feel like I can be alright.", outcome.label)).await;
+						let _ = msg.reply_ping(&ctx.http, format!("...My, you got [SR] {}. That is wonderful, isn't it. ...Fufu, whether the result is grand or modest, as long as I can share this time with you... I feel like I can be alright.", outcome.label)).await;
 					} else if tier_name == "R" {
-						let _ = msg.reply(&ctx.http, format!("...You received [R] {}. Please do not be discouraged... Even if fortune did not favor you this time... I am right here. I will accept everything about you, so... please, let me comfort you...", outcome.label)).await;
+						let _ = msg.reply_ping(&ctx.http, format!("...You received [R] {}. Please do not be discouraged... Even if fortune did not favor you this time... I am right here. I will accept everything about you, so... please, let me comfort you...", outcome.label)).await;
 					}
 				}
 			}
@@ -3176,7 +3176,7 @@ impl EventHandler for Handler {
 					return;
 				}
 
-				if let Ok(bot_reply) = msg.reply(&ctx.http, outcome.message).await {
+				if let Ok(bot_reply) = msg.reply_ping(&ctx.http, outcome.message).await {
 					let winner_msg_link = msg.link();
 					let bot_reply_link = bot_reply.link();
 
